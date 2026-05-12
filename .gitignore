@@ -1,0 +1,13 @@
+.venv/
+.stembatch/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.DS_Store
+
+models/
+*.wav
+*.m4a
+*.mp4
+*.flac

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traktor-stem-batch"
+version = "0.1.0"
+description = "Batch source separation and Traktor Stem file builder"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+license = { text = "MIT" }
+authors = [{ name = "stems" }]
+keywords = ["traktor", "stems", "source-separation", "dj"]
+dependencies = [
+  "demucs>=4.0.1",
+  "demucs-mlx @ git+https://github.com/andrade0/demucs-mlx.git",
+  "numpy>=1.26",
+  "soundfile>=0.12",
+  "stempeg>=0.2.6",
+]
+
+[dependency-groups]
+dev = []
+
+[project.scripts]
+traktor-stem-batch = "traktor_stem_batch.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/traktor_stem_batch"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
