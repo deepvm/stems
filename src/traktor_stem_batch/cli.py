@@ -19,8 +19,8 @@ from .container.stem_mp4 import (
 from .errors import StemBatchError
 from .models import Track
 from .paths import DEFAULT_MUSIC_DIR, DEFAULT_STATE_DIR, DEFAULT_TRAKTOR_STEMS_DIR, find_default_collection
-from .scanner import scan_music_dir
-from .separation.backends import build_backend
+from .scanner import scan_music_dir, title_artist_from_filename
+from .separation.backends import SUPPORTED_MLX_MODELS, build_backend
 from .state import JobState
 from .traktor.native import calibration_matches, candidate_stem_names, native_stem_path
 from .traktor.logs import logged_native_stem_path
@@ -68,6 +68,34 @@ def _enrich_tracks(tracks: list[Track], collection: TraktorCollection | None) ->
         else:
             enriched.append(track)
     return enriched
+
+
+def _single_track(audio_path: Path, collection: TraktorCollection | None) -> Track:
+    audio_path = audio_path.expanduser()
+    if not audio_path.exists():
+        raise StemBatchError(f"audio file not found: {audio_path}")
+    if not audio_path.is_file():
+        raise StemBatchError(f"audio path is not a file: {audio_path}")
+    if collection is not None:
+        entry = collection.find(audio_path)
+        if entry is not None:
+            return Track(
+                path=entry.path,
+                title=entry.title or audio_path.stem,
+                artist=entry.artist,
+                audio_id=entry.audio_id,
+            )
+    title, artist = title_artist_from_filename(audio_path)
+    return Track(path=audio_path, title=title, artist=artist)
+
+
+def _process_tracks(args: argparse.Namespace, collection: TraktorCollection | None) -> list[Track]:
+    if args.audio:
+        return [_single_track(Path(args.audio), collection)]
+    tracks = _enrich_tracks(scan_music_dir(Path(args.music_dir)), collection)
+    if args.limit:
+        tracks = tracks[: args.limit]
+    return tracks
 
 
 def _traktor_is_running() -> bool:
@@ -161,8 +189,8 @@ def _cleanup_work_dir(path: Path, root: Path) -> None:
 def _validate_process_args(args: argparse.Namespace) -> None:
     if args.backend != "demucs-mlx":
         raise StemBatchError("only --backend demucs-mlx is supported")
-    if args.model != "htdemucs":
-        raise StemBatchError("only --model htdemucs is supported")
+    if args.model not in SUPPORTED_MLX_MODELS:
+        raise StemBatchError("only --model htdemucs or --model htdemucs_ft is supported")
     if args.shifts != 1:
         raise StemBatchError("only --shifts 1 is supported")
     if args.track_workers != 1:
@@ -277,9 +305,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         cache_limit_mb=args.mlx_cache_limit_mb,
         memory_limit_mb=args.mlx_memory_limit_mb,
     )
-    tracks = _enrich_tracks(scan_music_dir(music_dir), collection)
-    if args.limit:
-        tracks = tracks[: args.limit]
+    tracks = _process_tracks(args, collection)
 
     collection_backup: Path | None = None
     pending: list[ProcessItem] = []
@@ -428,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     process = sub.add_parser("process")
     process.add_argument("--music-dir", default=str(DEFAULT_MUSIC_DIR))
+    process.add_argument("--audio")
     process.add_argument("--collection")
     process.add_argument("--stems-dir", default=str(DEFAULT_TRAKTOR_STEMS_DIR))
     process.add_argument("--mode", choices=("native",), default="native")
@@ -436,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("demucs-mlx",),
         default="demucs-mlx",
     )
-    process.add_argument("--model", default="htdemucs")
+    process.add_argument("--model", choices=SUPPORTED_MLX_MODELS, default="htdemucs")
     process.add_argument("--shifts", type=int, default=1)
     process.add_argument("--track-workers", type=int, default=1)
     process.add_argument("--mlx-cache-limit-mb", type=int, default=512)

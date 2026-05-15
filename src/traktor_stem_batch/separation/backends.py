@@ -7,11 +7,22 @@ import shlex
 import shutil
 import subprocess
 import threading
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
 from ..errors import BackendError, MissingDependencyError
 from ..models import StemSet
+
+SUPPORTED_MLX_MODELS = ("htdemucs", "htdemucs_ft")
+
+
+@dataclass(frozen=True)
+class MlxModelBag:
+    models: list[object]
+    weights: list[list[float]]
+    sources: list[str]
+    samplerate: int
 
 
 def _run_command(cmd: list[str], verbose: bool = False) -> None:
@@ -42,8 +53,8 @@ class MlxDemucsBackend:
         cache_limit_mb: int = 512,
         memory_limit_mb: int = 8192,
     ):
-        if model != "htdemucs":
-            raise BackendError("only --model htdemucs is supported")
+        if model not in SUPPORTED_MLX_MODELS:
+            raise BackendError("only --model htdemucs or --model htdemucs_ft is supported")
         if shifts != 1:
             raise BackendError("only --shifts 1 is supported")
         self.model_name = model
@@ -75,8 +86,35 @@ class MlxDemucsBackend:
                 pretrained.REMOTE_ROOT = Path(str(resources.files("demucs").joinpath("remote")))
                 if not self.verbose:
                     logging.getLogger("demucs_mlx.pretrained").setLevel(logging.ERROR)
-                self._model = pretrained.load_model(self.model_name)
+                if self.model_name == "htdemucs_ft":
+                    self._model = self._load_fine_tuned_bag(pretrained.REMOTE_ROOT, pretrained)
+                else:
+                    self._model = pretrained.load_model(self.model_name)
         return self._model
+
+    @staticmethod
+    def _load_fine_tuned_bag(remote_root: Path, pretrained) -> MlxModelBag:
+        import yaml
+
+        with open(remote_root / "htdemucs_ft.yaml") as handle:
+            config = yaml.safe_load(handle)
+        signatures = config["models"]
+        models = [pretrained.load_model(signature) for signature in signatures]
+        weights = config.get("weights")
+        if weights is None:
+            weights = [[1.0 for _ in models[0].sources] for _ in models]
+        first = models[0]
+        for model in models[1:]:
+            if model.sources != first.sources:
+                raise BackendError("htdemucs_ft checkpoints have different source layouts")
+            if model.samplerate != first.samplerate:
+                raise BackendError("htdemucs_ft checkpoints have different sample rates")
+        return MlxModelBag(
+            models=models,
+            weights=weights,
+            sources=list(first.sources),
+            samplerate=int(first.samplerate),
+        )
 
     def _configure_memory(self) -> None:
         if self._memory_configured:
@@ -137,6 +175,53 @@ class MlxDemucsBackend:
             mixed[: array.shape[0], : array.shape[1]] += array.astype("float32", copy=False)
         return mixed
 
+    def _apply_single_model(self, model, mix, apply_model):
+        return apply_model(
+            model,
+            mix,
+            shifts=1,
+            split=True,
+            overlap=self.overlap,
+            progress=self.verbose,
+        )
+
+    def _separate_to_arrays(self, loaded_model, mix, apply_model) -> dict[str, object]:
+        import mlx.core as mx
+        import numpy as np
+
+        if isinstance(loaded_model, MlxModelBag):
+            source_arrays = {}
+            totals = {source: 0.0 for source in loaded_model.sources}
+            for model, model_weights in zip(loaded_model.models, loaded_model.weights):
+                sources = self._apply_single_model(model, mix, apply_model)
+                mx.eval(sources)
+                for index, (source, weight) in enumerate(zip(model.sources, model_weights)):
+                    if not weight:
+                        continue
+                    array = np.array(sources[0, index]).T * float(weight)
+                    if source in source_arrays:
+                        source_arrays[source] = source_arrays[source] + array
+                    else:
+                        source_arrays[source] = array
+                    totals[source] += float(weight)
+                del sources
+                self._release_transient_memory()
+            for source, total in totals.items():
+                if total:
+                    source_arrays[source] = source_arrays[source] / total
+            return source_arrays
+
+        sources = self._apply_single_model(loaded_model, mix, apply_model)
+        mx.eval(sources)
+        try:
+            return {
+                source: np.array(sources[0, index]).T
+                for index, source in enumerate(loaded_model.sources)
+            }
+        finally:
+            del sources
+            self._release_transient_memory()
+
     def separate(self, input_path: Path, work_dir: Path, dry_run: bool = False) -> StemSet:
         out_dir = work_dir / "separated" / self.model_name / input_path.stem
         if dry_run:
@@ -169,24 +254,11 @@ class MlxDemucsBackend:
         model = self._load_model()
         wav_path = self._prepare_wav(input_path, work_dir / "mlx_input", int(model.samplerate))
         wav = None
-        sources = None
         source_arrays = None
         other_parts = None
         try:
             wav, sample_rate = sf.read(str(wav_path), always_2d=True, dtype="float32")
-            sources = apply_model(
-                model,
-                mx.array(wav.T[None, :, :]),
-                shifts=1,
-                split=True,
-                overlap=self.overlap,
-                progress=self.verbose,
-            )
-            mx.eval(sources)
-            source_arrays = {
-                source: np.array(sources[0, index]).T
-                for index, source in enumerate(model.sources)
-            }
+            source_arrays = self._separate_to_arrays(model, mx.array(wav.T[None, :, :]), apply_model)
 
             missing = [name for name in ("drums", "bass", "vocals") if name not in source_arrays]
             if missing:
@@ -219,7 +291,7 @@ class MlxDemucsBackend:
                 vocals=paths["vocals"],
             )
         finally:
-            del sources, source_arrays, other_parts, wav
+            del source_arrays, other_parts, wav
             self._release_transient_memory()
 
 
