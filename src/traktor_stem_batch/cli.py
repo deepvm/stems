@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -10,17 +11,16 @@ from pathlib import Path
 
 from . import __version__
 from .container.stem_mp4 import (
-    build_package_plan,
     dependency_report,
     verify_native_metadata,
     verify_with_ffprobe,
-    write_stem_file,
+    write_native_stem_arrays,
 )
 from .errors import StemBatchError
 from .models import Track
 from .paths import DEFAULT_MUSIC_DIR, DEFAULT_STATE_DIR, DEFAULT_TRAKTOR_STEMS_DIR, find_default_collection
 from .scanner import scan_music_dir, title_artist_from_filename
-from .separation.backends import SUPPORTED_MLX_MODELS, build_backend
+from .separation.backends import SUPPORTED_BACKENDS, SUPPORTED_MLX_MODELS, build_backend
 from .state import JobState
 from .traktor.native import calibration_matches, candidate_stem_names, native_stem_path
 from .traktor.logs import logged_native_stem_path
@@ -187,14 +187,16 @@ def _cleanup_work_dir(path: Path, root: Path) -> None:
 
 
 def _validate_process_args(args: argparse.Namespace) -> None:
-    if args.backend != "demucs-mlx":
+    if args.backend not in SUPPORTED_BACKENDS:
         raise StemBatchError("only --backend demucs-mlx is supported")
     if args.model not in SUPPORTED_MLX_MODELS:
-        raise StemBatchError("only --model htdemucs or --model htdemucs_ft is supported")
-    if args.shifts != 1:
-        raise StemBatchError("only --shifts 1 is supported")
+        raise StemBatchError("only --model htdemucs is supported")
+    if args.shifts < 0:
+        raise StemBatchError("--shifts must be 0 or greater")
     if args.track_workers != 1:
         raise StemBatchError("only --track-workers 1 is supported")
+    if args.batch_size <= 0:
+        raise StemBatchError("--batch-size must be greater than 0")
     if args.mlx_cache_limit_mb < 0:
         raise StemBatchError("--mlx-cache-limit-mb must be 0 or greater")
     if args.mlx_memory_limit_mb < 0:
@@ -214,42 +216,62 @@ def _process_item(
 ) -> ProcessResult:
     started = time.monotonic()
     work_dir = work_dir_root / sanitize_filename(item.track.path.stem)
-    stem_set = backend.separate(item.track.path, work_dir=work_dir, dry_run=dry_run)
-    plan = build_package_plan(
-        stems=stem_set,
+    separated = backend.separate(item.track.path, dry_run=dry_run)
+    if dry_run:
+        print(
+            json.dumps(
+                {
+                    "output": str(item.output),
+                    "codec": codec,
+                    "bitrate": bitrate,
+                    "sample_rate": sample_rate,
+                    "native": native,
+                    "streams": [
+                        {"slot": "master", "path": str(item.track.path)},
+                        {"slot": "drums", "source": f"{backend.name}:drums"},
+                        {"slot": "bass", "source": f"{backend.name}:bass"},
+                        {"slot": "other", "source": f"{backend.name}:other"},
+                        {"slot": "vocals", "source": f"{backend.name}:vocals"},
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
+    if separated is None:
+        raise StemBatchError("demucs-mlx did not return stems")
+    write_native_stem_arrays(
+        master=separated.master,
+        stems=separated.stems,
         output=item.output,
+        sample_rate=separated.sample_rate,
         codec=codec,
         bitrate=bitrate,
-        sample_rate=sample_rate,
-        native=native,
+        output_sample_rate=sample_rate,
     )
-    write_stem_file(plan, dry_run=dry_run)
-    if not dry_run:
-        ok, message = verify_with_ffprobe(item.output)
-        if not ok:
-            raise StemBatchError(message)
-        ok, message = verify_native_metadata(item.output)
-        if not ok:
-            raise StemBatchError(message)
+    ok, message = verify_with_ffprobe(item.output)
+    if not ok:
+        raise StemBatchError(message)
+    ok, message = verify_native_metadata(item.output)
+    if not ok:
+        raise StemBatchError(message)
     return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"traktor-stem-batch {__version__}")
     report = dependency_report()
-    for key in ("ffmpeg", "ffprobe", "MP4Box", "stempeg", "numpy", "soundfile"):
+    for key in ("ffmpeg", "ffprobe", "MP4Box", "numpy"):
         print(f"{key}: {human_bool(report[key])}")
     git_available = shutil.which("git") is not None
     print(f"git: {human_bool(git_available)}")
     try:
-        import demucs  # noqa: F401
-        import demucs_mlx  # noqa: F401
-        import mlx  # noqa: F401
+        __import__("demucs_mlx")
+        demucs_mlx_ok = True
     except Exception:
-        demucs_mlx_available = False
-    else:
-        demucs_mlx_available = True
-    print(f"demucs-mlx: {human_bool(demucs_mlx_available)}")
+        demucs_mlx_ok = False
+    print(f"demucs-mlx: {human_bool(demucs_mlx_ok)}")
 
     found = find_default_collection()
     print(f"default collection: {found if found else 'not found'}")
@@ -258,11 +280,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         warnings.append("ffmpeg/ffprobe missing: run `brew install ffmpeg`")
     if not report["MP4Box"]:
         warnings.append("MP4Box missing: run `brew install gpac`")
-    if not report["stempeg"]:
-        warnings.append("stempeg missing: run `uv sync`")
-    if not report["numpy"] or not report["soundfile"]:
+    if not report["numpy"]:
         warnings.append("audio Python deps missing: run `uv sync`")
-    if not demucs_mlx_available:
+    if not demucs_mlx_ok:
         warnings.append("demucs-mlx missing: run `uv sync`")
     if not git_available:
         warnings.append("git missing: run `brew install git`; uv uses it to install demucs-mlx")
@@ -304,6 +324,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         verbose=args.verbose_backend,
         cache_limit_mb=args.mlx_cache_limit_mb,
         memory_limit_mb=args.mlx_memory_limit_mb,
+        batch_size=args.batch_size,
     )
     tracks = _process_tracks(args, collection)
 
@@ -460,12 +481,13 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--mode", choices=("native",), default="native")
     process.add_argument(
         "--backend",
-        choices=("demucs-mlx",),
+        choices=SUPPORTED_BACKENDS,
         default="demucs-mlx",
     )
     process.add_argument("--model", choices=SUPPORTED_MLX_MODELS, default="htdemucs")
     process.add_argument("--shifts", type=int, default=1)
     process.add_argument("--track-workers", type=int, default=1)
+    process.add_argument("--batch-size", type=int, default=1)
     process.add_argument("--mlx-cache-limit-mb", type=int, default=512)
     process.add_argument("--mlx-memory-limit-mb", type=int, default=8192)
     process.add_argument("--work-dir", default=str(DEFAULT_STATE_DIR / "work"))

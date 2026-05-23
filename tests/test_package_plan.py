@@ -1,11 +1,10 @@
 from pathlib import Path
-import shutil
 import tempfile
 import unittest
 
 from traktor_stem_batch.audio.wavtools import write_test_wav, wav_info
 from traktor_stem_batch.container.stem_mp4 import (
-    _load_audio_tensor,
+    _stack_master_and_stems,
     build_package_plan,
     native_metadata_json,
 )
@@ -37,25 +36,20 @@ class PackagePlanTests(unittest.TestCase):
         self.assertIn('"name":"Vocals"', payload)
         self.assertNotIn('"Vox"', payload)
 
-    @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg not installed")
-    def test_load_audio_tensor_resamples_to_target_rate(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paths = []
-            for index, name in enumerate(("master", "drums", "bass", "other", "vocals"), start=1):
-                path = root / f"{name}.wav"
-                write_test_wav(
-                    path,
-                    frequency=100.0 * index,
-                    sample_rate=48000 if name == "master" else 44100,
-                )
-                paths.append(path)
+    def test_stack_arrays_uses_traktor_order(self):
+        import numpy as np
 
-            data, rate = _load_audio_tensor(paths, target_sample_rate=44100)
-
-            self.assertEqual(rate, 44100)
-            self.assertEqual(data.shape[0], 5)
-            self.assertEqual(data.shape[2], 2)
+        master = np.zeros((2, 4), dtype="float32")
+        stems = {
+            "drums": np.ones((2, 3), dtype="float32"),
+            "bass": np.ones((2, 4), dtype="float32") * 2,
+            "other": np.ones((2, 2), dtype="float32") * 3,
+            "vocals": np.ones((2, 4), dtype="float32") * 4,
+        }
+        data = _stack_master_and_stems(master, stems)
+        self.assertEqual(data.shape, (5, 4, 2))
+        self.assertEqual(data[1, 0, 0], 0.99)
+        self.assertEqual(data[4, 0, 0], 0.99)
 
 
 if __name__ == "__main__":

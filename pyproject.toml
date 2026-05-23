@@ -13,10 +13,9 @@ authors = [{ name = "stems" }]
 keywords = ["traktor", "stems", "source-separation", "dj"]
 dependencies = [
   "demucs>=4.0.1",
-  "demucs-mlx @ git+https://github.com/andrade0/demucs-mlx.git",
+  "demucs-mlx",
+  "mlx>=0.31",
   "numpy>=1.26",
-  "soundfile>=0.12",
-  "stempeg>=0.2.6",
 ]
 
 [dependency-groups]
@@ -30,3 +29,6 @@ packages = ["src/traktor_stem_batch"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv.sources]
+demucs-mlx = { git = "https://github.com/andrade0/demucs-mlx.git" }
