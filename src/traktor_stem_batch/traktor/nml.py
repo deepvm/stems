@@ -27,8 +27,12 @@ class TraktorCollection:
         self.path = path
         self.tree = ET.parse(path)
         self.root = self.tree.getroot()
+        self._entries_cache = None
+        self._by_path_cache = None
 
     def entries(self) -> list[CollectionEntry]:
+        if self._entries_cache is not None:
+            return self._entries_cache
         items: list[CollectionEntry] = []
         for entry in self.root.findall(".//ENTRY"):
             loc = entry.find("LOCATION")
@@ -46,10 +50,14 @@ class TraktorCollection:
                     audio_id=entry.get("AUDIO_ID"),
                 )
             )
+        self._entries_cache = items
         return items
 
     def by_path(self) -> dict[Path, CollectionEntry]:
-        return {entry.path: entry for entry in self.entries()}
+        if self._by_path_cache is not None:
+            return self._by_path_cache
+        self._by_path_cache = {entry.path: entry for entry in self.entries()}
+        return self._by_path_cache
 
     def find(self, audio_path: Path) -> CollectionEntry | None:
         target = audio_path.expanduser()

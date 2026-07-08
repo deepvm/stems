@@ -111,6 +111,14 @@ def _write_temp_m4a_files(
     import numpy as np
 
     length = max(track.shape[0] for track in tracks)
+    
+    # Pre-allocate stacked array for all 10 audio channels (5 tracks * 2 channels)
+    stacked = np.zeros((length, len(tracks) * 2), dtype="float32")
+    for index, track in enumerate(tracks):
+        count = min(length, track.shape[0])
+        if count:
+            stacked[:count, index * 2 : index * 2 + 2] = track[:count]
+
     filters = ";".join(
         f"[0:a]pan=stereo|c0=c{index * 2}|c1=c{index * 2 + 1}[a{index}]"
         for index in range(len(tracks))
@@ -150,15 +158,8 @@ def _write_temp_m4a_files(
     try:
         if process.stdin is None:
             raise StemBatchError("ffmpeg stdin is not available")
-        chunk_size = 65536
-        for start in range(0, length, chunk_size):
-            end = min(start + chunk_size, length)
-            frame = np.zeros((end - start, len(tracks) * 2), dtype="float32")
-            for index, track in enumerate(tracks):
-                count = max(0, min(end, track.shape[0]) - start)
-                if count:
-                    frame[:count, index * 2 : index * 2 + 2] = track[start : start + count]
-            process.stdin.write(frame.tobytes())
+        # Write the entire stacked array in a single call to minimize Python overhead
+        process.stdin.write(stacked.tobytes())
         process.stdin.close()
     except BrokenPipeError as exc:
         stderr = process.stderr.read().decode("utf-8", "ignore") if process.stderr else ""

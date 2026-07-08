@@ -203,60 +203,7 @@ def _validate_process_args(args: argparse.Namespace) -> None:
         raise StemBatchError("--mlx-memory-limit-mb must be 0 or greater")
 
 
-def _process_item(
-    *,
-    item: ProcessItem,
-    backend,
-    work_dir_root: Path,
-    codec: str,
-    bitrate: int,
-    sample_rate: int,
-    native: bool,
-    dry_run: bool,
-) -> ProcessResult:
-    started = time.monotonic()
-    work_dir = work_dir_root / sanitize_filename(item.track.path.stem)
-    separated = backend.separate(item.track.path, dry_run=dry_run)
-    if dry_run:
-        print(
-            json.dumps(
-                {
-                    "output": str(item.output),
-                    "codec": codec,
-                    "bitrate": bitrate,
-                    "sample_rate": sample_rate,
-                    "native": native,
-                    "streams": [
-                        {"slot": "master", "path": str(item.track.path)},
-                        {"slot": "drums", "source": f"{backend.name}:drums"},
-                        {"slot": "bass", "source": f"{backend.name}:bass"},
-                        {"slot": "other", "source": f"{backend.name}:other"},
-                        {"slot": "vocals", "source": f"{backend.name}:vocals"},
-                    ],
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-        return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
-    if separated is None:
-        raise StemBatchError("demucs-mlx did not return stems")
-    write_native_stem_arrays(
-        master=separated.master,
-        stems=separated.stems,
-        output=item.output,
-        sample_rate=separated.sample_rate,
-        codec=codec,
-        bitrate=bitrate,
-        output_sample_rate=sample_rate,
-    )
-    ok, message = verify_with_ffprobe(item.output)
-    if not ok:
-        raise StemBatchError(message)
-    ok, message = verify_native_metadata(item.output)
-    if not ok:
-        raise StemBatchError(message)
-    return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
+# Replaced by pipeline encode_and_finalize
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
@@ -339,7 +286,7 @@ def cmd_process(args: argparse.Namespace) -> int:
                 native_algorithm=args.native_algorithm,
             )
             item = ProcessItem(index=index, total=len(tracks), track=track, output=output)
-            if not args.dry_run and not args.reprocess_existing:
+            if not args.dry_run and not args.reprocess_existing and not args.force:
                 ready, reason = _native_stem_ready(output)
                 if ready:
                     if args.update_collection:
@@ -380,27 +327,154 @@ def cmd_process(args: argparse.Namespace) -> int:
                     state.set(item.track.path, "done", output_path=item.output)
                 _cleanup_work_dir(result.work_dir, work_dir_root)
 
-        for item in pending:
-            _status(f"[{item.index}/{item.total}] separate: {item.track.display_name}")
+        # ── Pipeline Setup ──
+        import queue
+        import threading
+        import gc
+        from concurrent.futures import ThreadPoolExecutor
+        from .separation.backends import SeparatedAudio, STEM_NAMES, apply_model_batched
+        import mlx.core as mx
+        import numpy as np
+
+        decode_queue = queue.Queue(maxsize=1)
+        decode_error = None
+
+        def decode_worker():
+            nonlocal decode_error
             try:
-                result = _process_item(
+                model = backend._load_model()
+                sample_rate = int(model.samplerate)
+                for item in pending:
+                    if args.verbose_backend:
+                        _status(f"[{item.index}/{item.total}] pre-decode: {item.track.display_name}")
+                    master = backend._load_audio(item.track.path, sample_rate)
+                    decode_queue.put((item, master, sample_rate))
+            except Exception as e:
+                decode_error = e
+                decode_queue.put(None)
+
+        decode_thread = threading.Thread(target=decode_worker, daemon=True)
+        decode_thread.start()
+
+        def encode_and_finalize(item, separated_audio, codec, bitrate, output_sample_rate, native, dry_run):
+            started = time.monotonic()
+            work_dir = work_dir_root / sanitize_filename(item.track.path.stem)
+            
+            if dry_run:
+                print(
+                    json.dumps(
+                        {
+                            "output": str(item.output),
+                            "codec": codec,
+                            "bitrate": bitrate,
+                            "sample_rate": output_sample_rate,
+                            "native": native,
+                            "streams": [
+                                {"slot": "master", "path": str(item.track.path)},
+                                {"slot": "drums", "source": f"{backend.name}:drums"},
+                                {"slot": "bass", "source": f"{backend.name}:bass"},
+                                {"slot": "other", "source": f"{backend.name}:other"},
+                                {"slot": "vocals", "source": f"{backend.name}:vocals"},
+                            ],
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                write_native_stem_arrays(
+                    master=separated_audio.master,
+                    stems=separated_audio.stems,
+                    output=item.output,
+                    sample_rate=separated_audio.sample_rate,
+                    codec=codec,
+                    bitrate=bitrate,
+                    output_sample_rate=output_sample_rate,
+                )
+                ok, msg = verify_with_ffprobe(item.output)
+                if not ok:
+                    raise StemBatchError(msg)
+                ok, msg = verify_native_metadata(item.output)
+                if not ok:
+                    raise StemBatchError(msg)
+                    
+            return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
+
+        # Thread pool for encoding/MP4Box packaging (max 2 concurrent encoders)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            
+            for item in pending:
+                if decode_error:
+                    raise decode_error
+                
+                # Retrieve pre-decoded audio
+                decode_res = decode_queue.get()
+                if decode_res is None:
+                    if decode_error:
+                        raise decode_error
+                    raise StemBatchError("Pre-decode worker stopped unexpectedly")
+                
+                item_q, master, sample_rate = decode_res
+                assert item_q == item
+                
+                _status(f"[{item.index}/{item.total}] separate: {item.track.display_name}")
+                
+                # Main GPU separation stage (runs on the main thread for GIL and KeyboardInterrupt stability)
+                model = backend._load_model()
+                started_gpu = time.monotonic()
+                try:
+                    out = apply_model_batched(
+                        model,
+                        mx.array(master[None]),
+                        batch_size=backend.batch_size,
+                        shifts=backend.shifts,
+                        split=True,
+                        overlap=0.25,
+                        progress=backend.verbose,
+                        segment=None,
+                    )
+                    mx.eval(out)
+                except Exception as exc:
+                    mx.clear_cache()
+                    gc.collect()
+                    raise exc
+                
+                separated = np.array(out[0]).astype("float32", copy=False)
+                stems = {name: separated[index] for index, name in enumerate(STEM_NAMES)}
+                backend._validate_stem_sum(master, stems)
+                
+                separated_audio = SeparatedAudio(master=master, stems=stems, sample_rate=sample_rate)
+                
+                # Cleanup MLX GPU caches immediately
+                mx.clear_cache()
+                gc.collect()
+                
+                # Dispatch encoding task to CPU thread pool
+                future = executor.submit(
+                    encode_and_finalize,
                     item=item,
-                    backend=backend,
-                    work_dir_root=work_dir_root,
+                    separated_audio=separated_audio,
                     codec=args.codec,
                     bitrate=args.bitrate,
-                    sample_rate=args.sample_rate,
-                    native=args.mode == "native",
-                    dry_run=args.dry_run,
+                    output_sample_rate=args.sample_rate,
+                    native=(args.mode == "native"),
+                    dry_run=args.dry_run
                 )
-            except Exception as exc:
-                if state is not None:
-                    state.set(item.track.path, "error", output_path=item.output, error=str(exc))
-                if not args.continue_on_error:
-                    raise
-                _status(f"[{item.index}/{item.total}] error: {item.track.display_name}: {exc}")
-            else:
-                finish_result(result)
+                futures.append((item, future))
+                
+            # Process results as they complete
+            for item, future in futures:
+                try:
+                    result = future.result()
+                    finish_result(result)
+                except Exception as exc:
+                    if state is not None:
+                        state.set(item.track.path, "error", output_path=item.output, error=str(exc))
+                    if not args.continue_on_error:
+                        raise
+                    _status(f"[{item.index}/{item.total}] error: {item.track.display_name}: {exc}")
+
     except Exception as exc:
         if state is not None and "item" in locals():
             state.set(item.track.path, "error", output_path=item.output, error=str(exc))
