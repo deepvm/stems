@@ -188,19 +188,21 @@ def _cleanup_work_dir(path: Path, root: Path) -> None:
 
 def _validate_process_args(args: argparse.Namespace) -> None:
     if args.backend not in SUPPORTED_BACKENDS:
-        raise StemBatchError("only --backend demucs-mlx is supported")
+        raise StemBatchError(f"only --backend in {SUPPORTED_BACKENDS} is supported")
     if args.model not in SUPPORTED_MLX_MODELS:
-        raise StemBatchError("only --model htdemucs is supported")
+        raise StemBatchError(f"only --model in {SUPPORTED_MLX_MODELS} is supported")
     if args.shifts < 0:
         raise StemBatchError("--shifts must be 0 or greater")
     if args.track_workers != 1:
         raise StemBatchError("only --track-workers 1 is supported")
-    if args.batch_size <= 0:
-        raise StemBatchError("--batch-size must be greater than 0")
+    if args.batch_size < 0:
+        raise StemBatchError("--batch-size must be 0 (for auto-detect) or greater")
     if args.mlx_cache_limit_mb < 0:
         raise StemBatchError("--mlx-cache-limit-mb must be 0 or greater")
     if args.mlx_memory_limit_mb < 0:
         raise StemBatchError("--mlx-memory-limit-mb must be 0 or greater")
+    if args.cooling_pause < 0:
+        raise StemBatchError("--cooling-pause must be 0 or greater")
 
 
 # Replaced by pipeline encode_and_finalize
@@ -264,6 +266,19 @@ def cmd_process(args: argparse.Namespace) -> int:
         raise StemBatchError("Traktor Pro 4 is running. Close Traktor before writing stems or collection flags.")
 
     state = None if args.dry_run else JobState(Path(args.state_db))
+    
+    batch_size = args.batch_size
+    if batch_size <= 0:
+        cores = detect_gpu_cores()
+        if cores:
+            batch_size = max(1, cores // 2)
+            if args.verbose_backend or args.dry_run:
+                _status(f"Auto-detected {cores} GPU cores. Setting batch-size to {batch_size}.")
+        else:
+            batch_size = 4
+            if args.verbose_backend or args.dry_run:
+                _status(f"GPU core detection failed. Using default batch-size {batch_size}.")
+
     backend = build_backend(
         name=args.backend,
         model=args.model,
@@ -271,7 +286,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         verbose=args.verbose_backend,
         cache_limit_mb=args.mlx_cache_limit_mb,
         memory_limit_mb=args.mlx_memory_limit_mb,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
     )
     tracks = _process_tracks(args, collection)
 
@@ -287,7 +302,10 @@ def cmd_process(args: argparse.Namespace) -> int:
             )
             item = ProcessItem(index=index, total=len(tracks), track=track, output=output)
             if not args.dry_run and not args.reprocess_existing and not args.force:
-                ready, reason = _native_stem_ready(output)
+                if state is not None and state.is_done_current(track.path) and output.exists():
+                    ready, reason = True, "state db shows done"
+                else:
+                    ready, reason = _native_stem_ready(output)
                 if ready:
                     if args.update_collection:
                         collection_backup, changed = _mark_collection_stem(
@@ -400,8 +418,13 @@ def cmd_process(args: argparse.Namespace) -> int:
                     
             return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
 
-        # Thread pool for encoding/MP4Box packaging (max 2 concurrent encoders)
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # Thread pool for encoding/MP4Box packaging, dynamically sized to prevent CPU starvation
+        import os
+        cpu_cores = os.cpu_count() or 4
+        max_workers = max(1, (cpu_cores - 2) // 5)
+        if args.verbose_backend or args.dry_run:
+            _status(f"CPU cores: {cpu_cores}. Setting parallel encoder workers to {max_workers}.")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             
             for item in pending:
@@ -462,6 +485,10 @@ def cmd_process(args: argparse.Namespace) -> int:
                     dry_run=args.dry_run
                 )
                 futures.append((item, future))
+                
+                # Optional cooling pause between tracks to prevent thermal throttling
+                if args.cooling_pause > 0 and not args.dry_run:
+                    time.sleep(args.cooling_pause)
                 
             # Process results as they complete
             for item, future in futures:
@@ -533,63 +560,249 @@ def cmd_calibrate_native(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="traktor-stem-batch")
-    parser.add_argument("--version", action="version", version=__version__)
-    sub = parser.add_subparsers(dest="command", required=True)
+def detect_gpu_cores() -> int | None:
+    import subprocess
+    import re
+    try:
+        result = subprocess.check_output(['system_profiler', 'SPDisplaysDataType'], encoding='utf-8')
+        match = re.search(r'Total Number of Cores:\s*(\d+)', result)
+        if match:
+            return int(match.group(1))
+        match = re.search(r'GPU Cores:\s*(\d+)', result)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return None
 
-    doctor = sub.add_parser("doctor")
+
+def build_parser() -> argparse.ArgumentParser:
+    # Calculate a safe default memory limit: 70% of total physical RAM
+    total_ram_mb = 8192
+    try:
+        import subprocess
+        output = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], encoding='utf-8')
+        total_ram_mb = int(output.strip()) // (1024 * 1024)
+    except Exception:
+        pass
+    default_memory_limit = max(4096, int(total_ram_mb * 0.70))
+
+    parser = argparse.ArgumentParser(
+        prog="traktor-stem-batch",
+        description="Batch music source separation and Traktor Pro 4 stem file builder."
+    )
+    parser.add_argument("--version", action="version", version=__version__)
+    sub = parser.add_subparsers(dest="command", required=True, help="Subcommands")
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="Run dependency diagnostics (checks ffmpeg, ffprobe, MP4Box, demucs-mlx, Traktor collection)."
+    )
     doctor.set_defaults(func=cmd_doctor)
 
-    scan = sub.add_parser("scan")
-    scan.add_argument("--music-dir", default=str(DEFAULT_MUSIC_DIR))
-    scan.add_argument("--collection")
-    scan.add_argument("--limit", type=int, default=0)
+    scan = sub.add_parser(
+        "scan",
+        help="Scan a directory and show which files match tracks in your Traktor library."
+    )
+    scan.add_argument(
+        "--music-dir",
+        default=str(DEFAULT_MUSIC_DIR),
+        help="Directory containing audio files to scan (default: %(default)s)"
+    )
+    scan.add_argument(
+        "--collection",
+        help="Path to Traktor's collection.nml file (auto-detected if omitted)"
+    )
+    scan.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limit scan to the first N files (0 for no limit, default: %(default)s)"
+    )
     scan.set_defaults(func=cmd_scan)
 
-    process = sub.add_parser("process")
-    process.add_argument("--music-dir", default=str(DEFAULT_MUSIC_DIR))
-    process.add_argument("--audio")
-    process.add_argument("--collection")
-    process.add_argument("--stems-dir", default=str(DEFAULT_TRAKTOR_STEMS_DIR))
-    process.add_argument("--mode", choices=("native",), default="native")
+    process = sub.add_parser(
+        "process",
+        help="Separate audio into stems and package them into Traktor-compatible stem files."
+    )
+    process.add_argument(
+        "--music-dir",
+        default=str(DEFAULT_MUSIC_DIR),
+        help="Directory containing audio files for batch processing (default: %(default)s)"
+    )
+    process.add_argument(
+        "--audio",
+        help="Path to a single audio track to process (ignores --music-dir)"
+    )
+    process.add_argument(
+        "--collection",
+        help="Path to Traktor's collection.nml file (auto-detected if omitted)"
+    )
+    process.add_argument(
+        "--stems-dir",
+        default=str(DEFAULT_TRAKTOR_STEMS_DIR),
+        help="Target directory where Traktor linked stems will be saved (default: %(default)s)"
+    )
+    process.add_argument(
+        "--mode",
+        choices=("native",),
+        default="native",
+        help="Stem generation/linking mode (default: %(default)s)"
+    )
     process.add_argument(
         "--backend",
         choices=SUPPORTED_BACKENDS,
         default="demucs-mlx",
+        help="Separation backend to use (choices: %(choices)s, default: %(default)s)"
     )
-    process.add_argument("--model", choices=SUPPORTED_MLX_MODELS, default="htdemucs")
-    process.add_argument("--shifts", type=int, default=1)
-    process.add_argument("--track-workers", type=int, default=1)
-    process.add_argument("--batch-size", type=int, default=1)
-    process.add_argument("--mlx-cache-limit-mb", type=int, default=512)
-    process.add_argument("--mlx-memory-limit-mb", type=int, default=8192)
-    process.add_argument("--work-dir", default=str(DEFAULT_STATE_DIR / "work"))
-    process.add_argument("--state-db", default=str(DEFAULT_STATE_DIR / "jobs.sqlite3"))
-    process.add_argument("--native-algorithm", default="traktor-md5-audio-id")
-    process.add_argument("--codec", default="aac")
-    process.add_argument("--bitrate", type=int, default=256000)
-    process.add_argument("--sample-rate", type=int, default=44100)
-    process.add_argument("--limit", type=int, default=0)
-    process.add_argument("--force", action="store_true")
-    process.add_argument("--reprocess-existing", action="store_true")
-    process.add_argument("--dry-run", action="store_true")
-    process.add_argument("--no-update-collection", dest="update_collection", action="store_false")
-    process.add_argument("--allow-running-traktor", action="store_true")
-    process.add_argument("--verbose-backend", action="store_true")
-    process.add_argument("--continue-on-error", action="store_true")
+    process.add_argument(
+        "--model",
+        choices=SUPPORTED_MLX_MODELS,
+        default="htdemucs",
+        help="MLX model to download/run from huggingface mlx-community/demucs-mlx-fp16 (choices: %(choices)s, default: %(default)s)"
+    )
+    process.add_argument(
+        "--shifts",
+        type=int,
+        default=0,
+        help="Number of random shifts for separation. 0 (default) is fastest, 1 is recommended for quality (default: %(default)s)"
+    )
+    process.add_argument(
+        "--track-workers",
+        type=int,
+        default=1,
+        help="Number of parallel track workers (default: %(default)s)"
+    )
+    process.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="MLX batch size for chunk separation (0 for auto-detect based on half of GPU cores, default: %(default)s)"
+    )
+    process.add_argument(
+        "--mlx-cache-limit-mb",
+        type=int,
+        default=512,
+        help="MLX compilation cache limit in MB (default: %(default)s)"
+    )
+    process.add_argument(
+        "--mlx-memory-limit-mb",
+        type=int,
+        default=default_memory_limit,
+        help="MLX memory limit in MB (default: %(default)s)"
+    )
+    process.add_argument(
+        "--cooling-pause",
+        type=float,
+        default=0.5,
+        help="Cooling pause in seconds between tracks to allow CPU/GPU to cool down (default: %(default)s)"
+    )
+    process.add_argument(
+        "--work-dir",
+        default=str(DEFAULT_STATE_DIR / "work"),
+        help="Directory for temporary processing files (default: %(default)s)"
+    )
+    process.add_argument(
+        "--state-db",
+        default=str(DEFAULT_STATE_DIR / "jobs.sqlite3"),
+        help="Path to SQLite database tracking job states (default: %(default)s)"
+    )
+    process.add_argument(
+        "--native-algorithm",
+        default="traktor-md5-audio-id",
+        help="Algorithm for calculating Traktor stem file name hash (default: %(default)s)"
+    )
+    process.add_argument(
+        "--codec",
+        default="aac",
+        help="Audio codec for stem streams (default: %(default)s)"
+    )
+    process.add_argument(
+        "--bitrate",
+        type=int,
+        default=256000,
+        help="Bitrate per stem channel in bps (default: %(default)s)"
+    )
+    process.add_argument(
+        "--sample-rate",
+        type=int,
+        default=44100,
+        help="Output sample rate in Hz (default: %(default)s)"
+    )
+    process.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limit processing to N files (0 for no limit, default: %(default)s)"
+    )
+    process.add_argument(
+        "--force",
+        action="store_true",
+        help="Force reprocessing and overwriting of existing stem files"
+    )
+    process.add_argument(
+        "--reprocess-existing",
+        action="store_true",
+        help="Reprocess tracks even if a valid stem already exists"
+    )
+    process.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show planned output paths without executing separation"
+    )
+    process.add_argument(
+        "--no-update-collection",
+        dest="update_collection",
+        action="store_false",
+        help="Do not update the Traktor collection.nml with generated-stem flags"
+    )
+    process.add_argument(
+        "--allow-running-traktor",
+        action="store_true",
+        help="Allow running while Traktor Pro 4 is active"
+    )
+    process.add_argument(
+        "--verbose-backend",
+        action="store_true",
+        help="Show MLX separation progress bar and detailed logs"
+    )
+    process.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue processing other files if a separation error occurs"
+    )
     process.set_defaults(update_collection=True)
     process.set_defaults(func=cmd_process)
 
-    verify = sub.add_parser("verify")
-    verify.add_argument("path")
+    verify = sub.add_parser(
+        "verify",
+        help="Validate that a generated .stem.mp4 file has exactly five streams and correct Traktor metadata."
+    )
+    verify.add_argument("path", help="Path to the stem file to verify")
     verify.set_defaults(func=cmd_verify)
 
-    calibrate = sub.add_parser("calibrate-native")
-    calibrate.add_argument("--collection")
-    calibrate.add_argument("--audio", required=True)
-    calibrate.add_argument("--stems-dir", default=str(DEFAULT_TRAKTOR_STEMS_DIR))
-    calibrate.add_argument("--stem-file")
+    calibrate = sub.add_parser(
+        "calibrate-native",
+        help="Calibrate and verify the expected native filename for Traktor's MD5 linked stem path."
+    )
+    calibrate.add_argument(
+        "--collection",
+        help="Path to Traktor's collection.nml file (auto-detected if omitted)"
+    )
+    calibrate.add_argument(
+        "--audio",
+        required=True,
+        help="Path to the source audio file"
+    )
+    calibrate.add_argument(
+        "--stems-dir",
+        default=str(DEFAULT_TRAKTOR_STEMS_DIR),
+        help="Target directory where Traktor linked stems are saved (default: %(default)s)"
+    )
+    calibrate.add_argument(
+        "--stem-file",
+        help="Optional stem filename to check calibration matches"
+    )
     calibrate.set_defaults(func=cmd_calibrate_native)
 
     return parser

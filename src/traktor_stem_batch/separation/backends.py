@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+if "HF_ENDPOINT" not in os.environ:
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import contextlib
 import gc
 import io
 import json
-import os
 import shutil
 import subprocess
 import inspect
@@ -23,7 +26,7 @@ from demucs_mlx.utils import center_trim
 from ..errors import BackendError, MissingDependencyError
 
 SUPPORTED_BACKENDS = ("demucs-mlx",)
-SUPPORTED_MLX_MODELS = ("htdemucs",)
+SUPPORTED_MLX_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s")
 STEM_NAMES = ("drums", "bass", "other", "vocals")
 
 
@@ -314,8 +317,8 @@ class MlxDemucsBackend:
         memory_limit_mb: int = 8192,
         batch_size: int = 1,
     ):
-        if model != "htdemucs":
-            raise BackendError("only --model htdemucs is supported")
+        if model not in SUPPORTED_MLX_MODELS:
+            raise BackendError(f"only --model {', '.join(SUPPORTED_MLX_MODELS)} are supported")
         if shifts < 0:
             raise BackendError("--shifts must be 0 or greater")
         if batch_size <= 0:
@@ -334,60 +337,77 @@ class MlxDemucsBackend:
         self._configure_mlx()
         
         cache_dir = Path.home() / '.cache' / 'demucs_mlx'
+        config_path = cache_dir / f"{self.model_name}_config.json"
         safetensors_path = cache_dir / f"{self.model_name}.safetensors"
-        config_path = cache_dir / f"{self.model_name}.json"
-        
-        try:
-            from demucs_mlx import pretrained
-        except Exception as exc:
-            raise MissingDependencyError("demucs-mlx is not installed. Run `uv sync`.") from exc
 
-        # Auto-pre-cache if files are missing
-        if not safetensors_path.exists() or not config_path.exists():
-            if self.verbose:
-                orig_model = pretrained.load_model(self.model_name, cache_dir=cache_dir)
-            else:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    orig_model = pretrained.load_model(self.model_name, cache_dir=cache_dir)
+        if not config_path.exists() or not safetensors_path.exists():
+            import urllib.request
+            import tempfile
             
-            # Find the downloaded .th file and convert it
-            th_files = list(cache_dir.glob("*.th"))
-            if th_files:
-                try:
-                    import torch
-                    from fractions import Fraction
-                    from demucs_mlx.weight_convert import convert_htdemucs_weights
-                    
-                    th_path = sorted(th_files, key=lambda p: p.stat().st_mtime)[-1]
-                    package = torch.load(th_path, map_location='cpu', weights_only=False)
-                    state = package['state']
-                    mlx_state = convert_htdemucs_weights(state)
-                    
-                    # Save safetensors in float16
-                    mlx_state_mx = {k: mx.array(v).astype(mx.float16) for k, v in mlx_state.items()}
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                    mx.save_safetensors(str(safetensors_path), mlx_state_mx)
-                    
-                    # Save config
-                    kwargs = package['kwargs']
-                    for k, v in list(kwargs.items()):
-                        if isinstance(v, Fraction):
-                            kwargs[k] = float(v)
-                    with open(config_path, 'w') as f:
-                        json.dump(kwargs, f, indent=2)
-                except Exception as exc:
-                    if self.verbose:
-                        print(f"Warning: could not pre-cache model weights: {exc}")
-                    self._model = orig_model
-                    return self._model
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
+            
+            config_url = f"{endpoint}/mlx-community/demucs-mlx-fp16/resolve/main/{self.model_name}_config.json"
+            safetensors_url = f"{endpoint}/mlx-community/demucs-mlx-fp16/resolve/main/{self.model_name}.safetensors"
 
-        # Load from safetensors directly
+            def download_file(url: str, dest: Path, desc: str):
+                if self.verbose:
+                    print(f"Downloading {desc} from {url}...")
+                # Create a temporary file in the destination directory to avoid partial writes
+                fd, temp_dest_str = tempfile.mkstemp(dir=str(dest.parent))
+                temp_dest = Path(temp_dest_str)
+                os.close(fd)
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req) as response, open(temp_dest, "wb") as out_file:
+                        total_size = int(response.headers.get('content-length', 0))
+                        downloaded = 0
+                        while True:
+                            chunk = response.read(1024 * 64)
+                            if not chunk:
+                                break
+                            out_file.write(chunk)
+                            downloaded += len(chunk)
+                            if self.verbose and total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                print(f"\rDownloading {desc}: {percent:.1f}% ({downloaded / 1024 / 1024:.1f}MB/{total_size / 1024 / 1024:.1f}MB)", end="", flush=True)
+                        if self.verbose:
+                            print("", flush=True)
+                    temp_dest.replace(dest)
+                except Exception as exc:
+                    if temp_dest.exists():
+                        temp_dest.unlink()
+                    raise BackendError(f"Failed to download {desc} from {url}: {exc}") from exc
+
+            try:
+                if not config_path.exists():
+                    download_file(config_url, config_path, f"{self.model_name} config")
+                if not safetensors_path.exists():
+                    download_file(safetensors_url, safetensors_path, f"{self.model_name} weights")
+            except Exception as exc:
+                raise BackendError(f"Model download failed: {exc}") from exc
+
+        # Load from downloaded files
         try:
             with open(config_path) as f:
                 config = json.load(f)
             
+            # Support both Hugging Face nested 'kwargs' format and flat format
+            params = config.get('kwargs', config)
+            
             sig = inspect.signature(HTDemucs.__init__)
-            valid_kwargs = {k: v for k, v in config.items() if k in sig.parameters}
+            valid_kwargs = {k: v for k, v in params.items() if k in sig.parameters}
+            
+            # Handle fraction strings like '39/5' for segment parameter
+            if 'segment' in valid_kwargs and isinstance(valid_kwargs['segment'], str):
+                from fractions import Fraction
+                try:
+                    valid_kwargs['segment'] = float(Fraction(valid_kwargs['segment']))
+                except Exception:
+                    pass
             
             model = HybridHTDemucs(**valid_kwargs)
             flat_state = mx.load(str(safetensors_path))
@@ -402,13 +422,7 @@ class MlxDemucsBackend:
             
             self._model = model
         except Exception as exc:
-            if self.verbose:
-                print(f"Error loading safetensors directly: {exc}. Falling back to PyTorch loader...")
-            if self.verbose:
-                self._model = pretrained.load_model(self.model_name, cache_dir=cache_dir)
-            else:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    self._model = pretrained.load_model(self.model_name, cache_dir=cache_dir)
+            raise BackendError(f"Error loading model from downloaded files: {exc}") from exc
         return self._model
 
     def _configure_mlx(self) -> None:
@@ -449,6 +463,7 @@ class MlxDemucsBackend:
             ],
             check=False,
             capture_output=True,
+            timeout=120,
         )
         if result.returncode != 0:
             message = result.stderr.decode("utf-8", "ignore").strip()

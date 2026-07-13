@@ -14,6 +14,7 @@ keywords = ["traktor", "stems", "source-separation", "dj"]
 dependencies = [
   "demucs>=4.0.1",
   "demucs-mlx",
+  "huggingface-hub>=1.22.0",
   "mlx>=0.31",
   "numpy>=1.26",
 ]

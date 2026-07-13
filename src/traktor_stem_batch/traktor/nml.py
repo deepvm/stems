@@ -29,6 +29,7 @@ class TraktorCollection:
         self.root = self.tree.getroot()
         self._entries_cache = None
         self._by_path_cache = None
+        self._element_by_path_cache = None
 
     def entries(self) -> list[CollectionEntry]:
         if self._entries_cache is not None:
@@ -56,24 +57,35 @@ class TraktorCollection:
     def by_path(self) -> dict[Path, CollectionEntry]:
         if self._by_path_cache is not None:
             return self._by_path_cache
-        self._by_path_cache = {entry.path: entry for entry in self.entries()}
+        cache = {}
+        for entry in self.entries():
+            cache[entry.path] = entry
+            try:
+                resolved = entry.path.expanduser().resolve()
+                cache[resolved] = entry
+            except OSError:
+                pass
+        self._by_path_cache = cache
         return self._by_path_cache
 
     def find(self, audio_path: Path) -> CollectionEntry | None:
         target = audio_path.expanduser()
-        direct = self.by_path().get(target)
-        if direct:
-            return direct
-        for entry in self.entries():
-            try:
-                if entry.path.samefile(target):
-                    return entry
-            except OSError:
-                continue
+        entry = self.by_path().get(target)
+        if entry is not None:
+            return entry
+        try:
+            resolved = target.resolve()
+            entry = self.by_path().get(resolved)
+            if entry is not None:
+                return entry
+        except OSError:
+            pass
         return None
 
-    def entry_element(self, audio_path: Path) -> ET.Element | None:
-        target = audio_path.expanduser()
+    def _element_by_path(self) -> dict[Path, ET.Element]:
+        if self._element_by_path_cache is not None:
+            return self._element_by_path_cache
+        cache = {}
         for entry in self.root.findall(".//ENTRY"):
             loc = entry.find("LOCATION")
             if loc is None:
@@ -83,13 +95,27 @@ class TraktorCollection:
             if not dir_value or not file_value:
                 continue
             entry_path = nml_dir_to_path(dir_value, file_value)
-            if entry_path == target:
-                return entry
+            cache[entry_path] = entry
             try:
-                if entry_path.samefile(target):
-                    return entry
+                resolved = entry_path.expanduser().resolve()
+                cache[resolved] = entry
             except OSError:
-                continue
+                pass
+        self._element_by_path_cache = cache
+        return self._element_by_path_cache
+
+    def entry_element(self, audio_path: Path) -> ET.Element | None:
+        target = audio_path.expanduser()
+        el = self._element_by_path().get(target)
+        if el is not None:
+            return el
+        try:
+            resolved = target.resolve()
+            el = self._element_by_path().get(resolved)
+            if el is not None:
+                return el
+        except OSError:
+            pass
         return None
 
     def mark_generated_stem(self, audio_path: Path) -> bool:

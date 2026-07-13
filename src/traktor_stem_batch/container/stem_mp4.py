@@ -158,18 +158,31 @@ def _write_temp_m4a_files(
     try:
         if process.stdin is None:
             raise StemBatchError("ffmpeg stdin is not available")
-        # Write the entire stacked array in a single call to minimize Python overhead
         process.stdin.write(stacked.tobytes())
         process.stdin.close()
-    except BrokenPipeError as exc:
-        stderr = process.stderr.read().decode("utf-8", "ignore") if process.stderr else ""
-        raise StemBatchError(stderr.strip() or "ffmpeg failed while encoding stems") from exc
+    except Exception as exc:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        if isinstance(exc, BrokenPipeError):
+            stderr = process.stderr.read().decode("utf-8", "ignore") if process.stderr else ""
+            raise StemBatchError(stderr.strip() or "ffmpeg failed while encoding stems") from exc
+        raise exc
     finally:
         if process.stdin and not process.stdin.closed:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
     stderr = process.stderr.read().decode("utf-8", "ignore") if process.stderr else ""
-    if process.wait() != 0:
-        raise StemBatchError(stderr.strip() or "ffmpeg failed while encoding stems")
+    try:
+        if process.wait(timeout=120) != 0:
+            raise StemBatchError(stderr.strip() or "ffmpeg failed while encoding stems")
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise StemBatchError("ffmpeg encoding timed out")
 
 
 def write_native_stem_arrays(
@@ -217,7 +230,10 @@ def write_native_stem_arrays(
                     str(output),
                 ]
             )
-            subprocess.run(cmd, check=True)
+            try:
+                subprocess.run(cmd, check=True, timeout=60)
+            except subprocess.TimeoutExpired as exc:
+                raise StemBatchError("MP4Box packaging timed out") from exc
     finally:
         del tracks
         gc.collect()
@@ -226,12 +242,16 @@ def write_native_stem_arrays(
 def verify_with_ffprobe(path: Path) -> tuple[bool, str]:
     if shutil.which("ffprobe") is None:
         return False, "ffprobe not found"
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-print_format", "json", str(path)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-print_format", "json", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "ffprobe verification timed out"
     if result.returncode != 0:
         return False, result.stderr.strip() or "ffprobe failed"
     streams = [stream for stream in json.loads(result.stdout).get("streams", []) if stream.get("codec_type") == "audio"]
@@ -243,7 +263,16 @@ def verify_with_ffprobe(path: Path) -> tuple[bool, str]:
 def verify_native_metadata(path: Path) -> tuple[bool, str]:
     if shutil.which("MP4Box") is None:
         return False, "MP4Box not found"
-    result = subprocess.run(["MP4Box", "-info", str(path)], check=False, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["MP4Box", "-info", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "MP4Box metadata verification timed out"
     if result.returncode != 0:
         return False, result.stderr.strip() or "MP4Box failed"
     info = result.stdout + result.stderr
