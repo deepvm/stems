@@ -27,6 +27,17 @@ from .traktor.logs import logged_native_stem_path
 from .traktor.nml import TraktorCollection
 from .util import human_bool, sanitize_filename
 
+def _detect_best_aac_codec() -> str:
+    if sys.platform != "darwin":
+        return "aac"
+    try:
+        output = subprocess.check_output(["ffmpeg", "-encoders"], stderr=subprocess.DEVNULL, encoding="utf-8")
+        if "aac_at" in output:
+            return "aac_at"
+    except Exception:
+        pass
+    return "aac"
+
 
 @dataclass(frozen=True)
 class ProcessItem:
@@ -166,7 +177,6 @@ def _mark_collection_stem(
     if collection_backup is None:
         collection_backup = collection.backup()
         _status(f"collection backup: {collection_backup}")
-    collection.write_atomic()
     return collection_backup, True
 
 
@@ -201,8 +211,10 @@ def _validate_process_args(args: argparse.Namespace) -> None:
         raise StemBatchError("--mlx-cache-limit-mb must be 0 or greater")
     if args.mlx_memory_limit_mb < 0:
         raise StemBatchError("--mlx-memory-limit-mb must be 0 or greater")
-    if args.cooling_pause < 0:
+    if args.cooling_pause is not None and args.cooling_pause < 0:
         raise StemBatchError("--cooling-pause must be 0 or greater")
+    if not (0 <= args.overlap < 1):
+        raise StemBatchError("--overlap must be between 0 (inclusive) and 1 (exclusive)")
 
 
 # Replaced by pipeline encode_and_finalize
@@ -267,17 +279,36 @@ def cmd_process(args: argparse.Namespace) -> int:
 
     state = None if args.dry_run else JobState(Path(args.state_db))
     
-    batch_size = args.batch_size
-    if batch_size <= 0:
-        cores = detect_gpu_cores()
-        if cores:
-            batch_size = max(1, cores // 2)
-            if args.verbose_backend or args.dry_run:
-                _status(f"Auto-detected {cores} GPU cores. Setting batch-size to {batch_size}.")
-        else:
-            batch_size = 4
-            if args.verbose_backend or args.dry_run:
-                _status(f"GPU core detection failed. Using default batch-size {batch_size}.")
+    # ── Resource Profile & Dynamic Scaling ──
+    import os
+    cpu_cores = os.cpu_count() or 4
+    gpu_cores = 16
+    try:
+        gpu_cores = detect_gpu_cores()
+    except Exception:
+        pass
+
+    # Apply profile defaults
+    if args.profile == "silent":
+        profile_batch_size = 4
+        profile_workers = 1
+        profile_cooling = 1.0
+    elif args.profile == "extreme":
+        profile_batch_size = max(1, gpu_cores // 2)
+        profile_workers = max(1, (cpu_cores - 1) // 5)
+        profile_cooling = 0.0
+    else:  # balanced
+        profile_batch_size = max(1, gpu_cores // 2)
+        profile_workers = max(1, (cpu_cores - 2) // 5)
+        profile_cooling = 0.5
+
+    batch_size = args.batch_size if args.batch_size > 0 else profile_batch_size
+    max_workers = profile_workers
+    cooling_pause = args.cooling_pause if args.cooling_pause is not None else profile_cooling
+
+    if args.verbose_backend or args.dry_run:
+        _status(f"Profile: {args.profile}. GPU cores: {gpu_cores}, CPU cores: {cpu_cores}.")
+        _status(f"Settings: batch-size={batch_size}, workers={max_workers}, cooling-pause={cooling_pause}s.")
 
     backend = build_backend(
         name=args.backend,
@@ -287,6 +318,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         cache_limit_mb=args.mlx_cache_limit_mb,
         memory_limit_mb=args.mlx_memory_limit_mb,
         batch_size=batch_size,
+        overlap=args.overlap,
     )
     tracks = _process_tracks(args, collection)
 
@@ -325,6 +357,25 @@ def cmd_process(args: argparse.Namespace) -> int:
 
         if not pending:
             return 0
+
+        # Perform compilation warm-up on the GPU natively in Metal
+        if not args.dry_run:
+            model = backend._load_model()
+            _status("Compiling model for GPU acceleration (warm-up)...")
+            import mlx.core as mx
+            warmup_start = time.monotonic()
+            segment_len = int(model.samplerate * float(model.segment))
+            
+            # Warm up for batch_size = 1
+            dummy_input_1 = mx.zeros((1, 2, segment_len), dtype=mx.float32)
+            mx.eval(model.forward_compiled(dummy_input_1))
+            
+            # Warm up for batch_size = batch_size
+            if batch_size > 1:
+                dummy_input_b = mx.zeros((batch_size, 2, segment_len), dtype=mx.float32)
+                mx.eval(model.forward_compiled(dummy_input_b))
+                
+            _status(f"Model compiled successfully in {time.monotonic() - warmup_start:.1f}s.")
 
         work_dir_root = Path(args.work_dir).expanduser()
 
@@ -419,11 +470,6 @@ def cmd_process(args: argparse.Namespace) -> int:
             return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
 
         # Thread pool for encoding/MP4Box packaging, dynamically sized to prevent CPU starvation
-        import os
-        cpu_cores = os.cpu_count() or 4
-        max_workers = max(1, (cpu_cores - 2) // 5)
-        if args.verbose_backend or args.dry_run:
-            _status(f"CPU cores: {cpu_cores}. Setting parallel encoder workers to {max_workers}.")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             
@@ -487,8 +533,8 @@ def cmd_process(args: argparse.Namespace) -> int:
                 futures.append((item, future))
                 
                 # Optional cooling pause between tracks to prevent thermal throttling
-                if args.cooling_pause > 0 and not args.dry_run:
-                    time.sleep(args.cooling_pause)
+                if cooling_pause > 0 and not args.dry_run:
+                    time.sleep(cooling_pause)
                 
             # Process results as they complete
             for item, future in futures:
@@ -507,6 +553,13 @@ def cmd_process(args: argparse.Namespace) -> int:
             state.set(item.track.path, "error", output_path=item.output, error=str(exc))
         raise
     finally:
+        if args.update_collection and collection_backup is not None:
+            _status("Saving updated Traktor collection to disk...")
+            try:
+                collection.write_atomic()
+                _status("Traktor collection saved successfully.")
+            except Exception as e:
+                _status(f"Error saving Traktor collection: {e}")
         if state is not None:
             state.close()
     return 0
@@ -692,10 +745,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="MLX memory limit in MB (default: %(default)s)"
     )
     process.add_argument(
+        "--profile",
+        choices=["silent", "balanced", "extreme"],
+        default="balanced",
+        help="Resource profile adjusting batch sizes, CPU thread workers, and cooling pauses (choices: %(choices)s, default: %(default)s)"
+    )
+    process.add_argument(
         "--cooling-pause",
         type=float,
-        default=0.5,
-        help="Cooling pause in seconds between tracks to allow CPU/GPU to cool down (default: %(default)s)"
+        default=None,
+        help="Cooling pause in seconds between tracks to allow CPU/GPU to cool down (default: derived from profile)"
+    )
+    process.add_argument(
+        "--overlap",
+        type=float,
+        default=0.1,
+        help="Overlap between chunks for separation (default: %(default)s)"
     )
     process.add_argument(
         "--work-dir",
@@ -714,7 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process.add_argument(
         "--codec",
-        default="aac",
+        default=_detect_best_aac_codec(),
         help="Audio codec for stem streams (default: %(default)s)"
     )
     process.add_argument(
@@ -809,6 +874,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .container.cleanup import init_cleanup_handlers
+    init_cleanup_handlers()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

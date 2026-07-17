@@ -23,6 +23,7 @@ from demucs_mlx.htdemucs import HTDemucs, apply_conv1d
 from demucs_mlx.pretrained import _load_weights
 from demucs_mlx.utils import center_trim
 
+from .mlx_stft import mlx_stft, mlx_istft
 from ..errors import BackendError, MissingDependencyError
 
 SUPPORTED_BACKENDS = ("demucs-mlx",)
@@ -39,9 +40,43 @@ class SeparatedAudio:
 
 class HybridHTDemucs(HTDemucs):
     """Subclass of HTDemucs to perform inference in hybrid Float16 precision.
-    STFT and iSTFT are computed in Float32 (required by PyTorch STFT on CPU),
-    while all heavy encoder/decoder/transformer layers run in Float16.
+    STFT and iSTFT are computed natively in MLX on the GPU (Metal).
     """
+    def _spec(self, x: mx.array):
+        if not hasattr(self, "_mlx_window"):
+            import math
+            N = self.nfft
+            n = mx.arange(N)
+            self._mlx_window = 0.5 - 0.5 * mx.cos(2 * math.pi * n / N)
+        return mlx_stft(x, self.nfft, self.hop_length, self._mlx_window)
+
+    def _ispec(self, z, length: int):
+        if not hasattr(self, "_mlx_window"):
+            import math
+            N = self.nfft
+            n = mx.arange(N)
+            self._mlx_window = 0.5 - 0.5 * mx.cos(2 * math.pi * n / N)
+        return mlx_istft(z, self.nfft, self.hop_length, self._mlx_window, length)
+
+    def _magnitude(self, z):
+        if self.cac:
+            z_real = mx.stack([mx.real(z), mx.imag(z)], axis=-1)
+            z_real = mx.transpose(z_real, (0, 1, 4, 2, 3))
+            B, C, _, Fr, T = z_real.shape
+            return z_real.reshape(B, C * 2, Fr, T)
+        else:
+            return mx.abs(z)
+
+    def _mask(self, z, m: mx.array):
+        if self.cac:
+            B, S, C_cac, Fr, T = m.shape
+            C = C_cac // 2
+            out = m.reshape(B, S, C, 2, Fr, T)
+            out = mx.transpose(out, (0, 1, 2, 4, 5, 3))
+            return out[..., 0] + 1j * out[..., 1]
+        else:
+            raise NotImplementedError("Only CaC mode supported for MLX port")
+
     def __call__(self, mix: mx.array) -> mx.array:
         length = mix.shape[-1]
         length_pre_pad = None
@@ -54,7 +89,7 @@ class HybridHTDemucs(HTDemucs):
                     (0, training_length - length_pre_pad)]
                 mix = mx.pad(mix, pad_widths)
 
-        # STFT (via PyTorch bridge) runs in float32
+        # STFT (pure MLX GPU)
         z = self._spec(mix)
         mag = self._magnitude(z)
         x = mag
@@ -155,8 +190,7 @@ class HybridHTDemucs(HTDemucs):
         x = x.reshape(B, S, -1, Fq, T)
         x = x * std[:, None] + mean[:, None]
 
-        # Inverse STFT (via PyTorch bridge)
-        x_np = np.array(x)
+        # Inverse STFT (pure MLX GPU)
         z_out = self._mask(z, x)
 
         if self.use_train_segment:
@@ -236,7 +270,10 @@ def apply_model_batched(
         else:
             padded = mix
 
-        out = model(padded)
+        if hasattr(model, "forward_compiled"):
+            out = model.forward_compiled(padded)
+        else:
+            out = model(padded)
         mx.eval(out)
         return center_trim(out, mix.shape[-1])
 
@@ -280,7 +317,10 @@ def apply_model_batched(
     chunk_outs_list = []
     for i in range(0, len(chunks), batch_size):
         batch_chunks = chunks_stacked[i:i + batch_size]
-        batch_out = model(batch_chunks)
+        if hasattr(model, "forward_compiled"):
+            batch_out = model.forward_compiled(batch_chunks)
+        else:
+            batch_out = model(batch_chunks)
         mx.eval(batch_out)
         chunk_outs_list.append(batch_out)
 
@@ -316,6 +356,7 @@ class MlxDemucsBackend:
         cache_limit_mb: int = 512,
         memory_limit_mb: int = 8192,
         batch_size: int = 1,
+        overlap: float = 0.1,
     ):
         if model not in SUPPORTED_MLX_MODELS:
             raise BackendError(f"only --model {', '.join(SUPPORTED_MLX_MODELS)} are supported")
@@ -329,6 +370,7 @@ class MlxDemucsBackend:
         self.cache_limit_mb = cache_limit_mb
         self.memory_limit_mb = memory_limit_mb
         self.batch_size = batch_size
+        self.overlap = overlap
         self._model = None
 
     def _load_model(self) -> HybridHTDemucs:
@@ -420,6 +462,9 @@ class MlxDemucsBackend:
             model.update(utils.tree_map(lambda x: x.astype(mx.float16), model.parameters()))
             mx.eval(model.parameters())
             
+            # Compile the model forward pass natively to Metal
+            model.forward_compiled = mx.compile(model)
+            
             self._model = model
         except Exception as exc:
             raise BackendError(f"Error loading model from downloaded files: {exc}") from exc
@@ -503,7 +548,7 @@ class MlxDemucsBackend:
                 batch_size=self.batch_size,
                 shifts=self.shifts,
                 split=True,
-                overlap=0.25,
+                overlap=self.overlap,
                 progress=self.verbose,
                 segment=None,
             )
@@ -525,6 +570,7 @@ def build_backend(
     cache_limit_mb: int = 512,
     memory_limit_mb: int = 8192,
     batch_size: int = 1,
+    overlap: float = 0.1,
 ) -> MlxDemucsBackend:
     if name not in SUPPORTED_BACKENDS:
         raise BackendError("only --backend demucs-mlx is supported")
@@ -535,4 +581,5 @@ def build_backend(
         cache_limit_mb=cache_limit_mb,
         memory_limit_mb=memory_limit_mb,
         batch_size=batch_size,
+        overlap=overlap,
     )

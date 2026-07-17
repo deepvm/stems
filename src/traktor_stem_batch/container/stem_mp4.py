@@ -205,35 +205,40 @@ def write_native_stem_arrays(
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory() as tmp:
             temp_dir = Path(tmp)
-            _write_temp_m4a_files(temp_dir, tracks, sample_rate, codec, bitrate, output_sample_rate)
-            if output.exists():
-                output.unlink()
-            metadata_payload = base64.b64encode(native_metadata_json().encode("utf-8")).decode("ascii")
-            cmd = ["MP4Box", "-new", "-timescale", str(output_sample_rate)]
-            for index in range(5):
-                cmd.extend(["-add", str(temp_dir / f"{index}.m4a#ID=Z")])
-            cmd.extend(
-                [
-                    "-no-iod",
-                    "-group-clean",
-                    "-brand",
-                    "mp42:1",
-                    "-ab",
-                    "isom",
-                    "-ab",
-                    "mp41",
-                    "-ab",
-                    "mp42",
-                    "-udta",
-                    "0:type=stem:src=base64," + metadata_payload,
-                    "-quiet",
-                    str(output),
-                ]
-            )
+            from . import cleanup
+            cleanup.register_temp_dir(temp_dir)
             try:
-                subprocess.run(cmd, check=True, timeout=60)
-            except subprocess.TimeoutExpired as exc:
-                raise StemBatchError("MP4Box packaging timed out") from exc
+                _write_temp_m4a_files(temp_dir, tracks, sample_rate, codec, bitrate, output_sample_rate)
+                if output.exists():
+                    output.unlink()
+                metadata_payload = base64.b64encode(native_metadata_json().encode("utf-8")).decode("ascii")
+                cmd = ["MP4Box", "-new", "-timescale", str(output_sample_rate)]
+                for index in range(5):
+                    cmd.extend(["-add", str(temp_dir / f"{index}.m4a#ID=Z")])
+                cmd.extend(
+                    [
+                        "-no-iod",
+                        "-group-clean",
+                        "-brand",
+                        "mp42:1",
+                        "-ab",
+                        "isom",
+                        "-ab",
+                        "mp41",
+                        "-ab",
+                        "mp42",
+                        "-udta",
+                        "0:type=stem:src=base64," + metadata_payload,
+                        "-quiet",
+                        str(output),
+                    ]
+                )
+                try:
+                    subprocess.run(cmd, check=True, timeout=60)
+                except subprocess.TimeoutExpired as exc:
+                    raise StemBatchError("MP4Box packaging timed out") from exc
+            finally:
+                cleanup.unregister_temp_dir(temp_dir)
     finally:
         del tracks
         gc.collect()
