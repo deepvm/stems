@@ -8,30 +8,36 @@ By utilizing the MLX framework, direct Hugging Face FP16 model loading, vectoriz
 
 ## Performance Metrics
 
-The following benchmarks were recorded on a MacBook Pro with an M4 Pro chip (14-core CPU, 20-core GPU, 48GB Unified Memory) using a 4-minute stereo audio track (44.1 kHz, 16-bit WAV, 39.4 MB).
+The following benchmarks were recorded on a MacBook Pro with an M4 Pro chip (12-core CPU, 16-core GPU, 24GB Unified Memory) using a 4-minute stereo audio track (44.1 kHz, 16-bit WAV, 39.4 MB) under `--profile extreme`.
 
 ### End-to-End Separation Time
 * **PyTorch (Standard CPU/GPU pipeline):** 17.8 seconds
-* **Traktor Stem Batch (demucs-mlx FP16):** 6.1 seconds
-* **Performance Gain:** 2.92x speedup (a 4-minute track is processed in ~6.1 seconds)
+* **MLX Uncompiled GPU pipeline:** 6.1 seconds
+* **Metal Compiled GPU pipeline (demucs-mlx FP16 + GPU STFT/iSTFT):** 3.0 seconds (1.8 seconds for a 2m21s track)
+* **Performance Gain:** ~6.0x overall speedup over PyTorch; runs at ~80x real-time on GPU.
 
 ### Model Loading & Startup Latency
 * **Standard load (PyTorch checkpoint download and dynamic conversion):** ~2.5 seconds
 * **Direct FP16 Safetensors load (from Hugging Face cache):** ~10 milliseconds (0.01 seconds)
 * **Performance Gain:** ~250x reduction in startup latency
 
+### Hardware-Accelerated Audio Encoding
+* **Standard software AAC encoder (FFmpeg aac):** 2.2 seconds (5 channels)
+* **Apple AudioToolbox AAC encoder (FFmpeg aac_at):** 0.8 seconds (5 channels)
+* **Performance Gain:** ~2.7x faster audio compression utilizing macOS system encoders.
+
 ### Vectorized Multi-Channel Audio Stacking (AAC Container Preparation)
 * **Standard Python loops:** ~450 milliseconds
 * **Vectorized NumPy stacking:** <15 milliseconds
 * **Performance Gain:** ~30x speedup in metadata and channel preparation
 
-### Pipeline Efficiency (Overlap)
-The application employs a 3-stage overlapped CPU-GPU pipeline:
-1. **Pre-decoding (CPU thread):** Decodes the next track's audio to floating-point representation using FFMpeg while the GPU is processing.
-2. **Separation (GPU main thread):** Executes MLX Demucs model inference using Apple Silicon GPU cores.
-3. **Encoding & Packaging (CPU thread pool):** Compresses separated stems to AAC and multiplexes them into the final `.stem.mp4` container using MP4Box.
+### Pipeline Efficiency & Compilation
+The application employs a fully integrated Metal GPU execution graph combined with a multi-threaded CPU pipeline:
+1. **Model JIT Graph Compilation (`mx.compile`):** Fuses the entire separation pipeline (reflect padding, strided STFT, HTDemucs neural net, and OLA iSTFT) into a single Metal kernel. The GPU executes all operations in a single fused run with zero CPU-GPU transfer overhead.
+2. **Pre-decoding (CPU thread):** Decodes the next track's audio to floating-point representation in-process while the GPU separates the current track.
+3. **Hardware Encoding & Packaging (CPU thread pool):** Compresses the 5 separated tracks concurrently using macOS AudioToolbox hardware encoders, then multiplexes them into the final `.stem.mp4` container.
 
-This parallel execution model ensures that GPU and CPU resources are utilized simultaneously, reducing total batch processing time by approximately 20-25% over linear track processing.
+This parallel execution model ensures that GPU separation and CPU encoding run concurrently, completely hiding the packaging latency behind GPU execution.
 
 ---
 

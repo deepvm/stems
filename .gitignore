@@ -1,13 +1,73 @@
+# Python virtual environment
 .venv/
+/venv/
+/ENV/
+
+# Local cache/state databases
 .stembatch/
+/stembatch_jobs.sqlite3
+
+# Python bytecode & runtime cache
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-.DS_Store
+*$py.class
+.ipynb_checkpoints/
 
+# Distribution / packaging
+/dist/
+/build/
+*.egg-info/
+/eggs/
+/lib/
+/parts/
+/sdist/
+/var/
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+/htmlcov/
+.tox/
+.noscript/
+
+# Type checking
+.mypy_cache/
+.pyre/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.*
+
+# Local compiled audio binaries
 models/
 *.wav
 *.m4a
+*.mp3
 *.mp4
 *.flac
+*.aif
+*.aiff
+
+# Rust build artifacts (if applicable)
+/target/
+Cargo.lock
