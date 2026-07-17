@@ -8,7 +8,7 @@ By utilizing the MLX framework, direct Hugging Face FP16 model loading, vectoriz
 
 ## Performance Metrics
 
-The following benchmarks were recorded on a MacBook Pro with an M4 Pro chip (12-core CPU, 16-core GPU, 24GB Unified Memory) using a 4-minute stereo audio track (44.1 kHz, 16-bit WAV, 39.4 MB) under `--profile extreme`.
+The following benchmarks were recorded on a MacBook Pro with an M4 Pro chip (12-core CPU, 16-core GPU, 24GB Unified Memory) using a 4-minute stereo audio track (44.1 kHz, 16-bit WAV, 39.4 MB) under `--profile ultra`.
 
 ### End-to-End Separation Time
 * **PyTorch (Standard CPU/GPU pipeline):** 17.8 seconds
@@ -45,8 +45,8 @@ This parallel execution model ensures that GPU separation and CPU encoding run c
 
 The utility requires the following system-level tools and libraries:
 * **Python:** 3.14.x
-* **FFmpeg / FFprobe:** Required for audio decoding, encoding, and metadata verification.
-* **gpac (MP4Box):** Required for multiplexing stem channels into Traktor-compatible MP4 containers.
+* **FFmpeg / FFprobe:** Required for hardware-accelerated audio encoding and fallback decoding.
+* **gpac (MP4Box):** Optional. Used only for diagnostic verification checks; stem multiplexing and Traktor metadata injection are handled entirely in-process.
 * **git:** Required for resolving repository-based dependencies.
 
 ---

@@ -484,36 +484,56 @@ class MlxDemucsBackend:
 
     @staticmethod
     def _load_audio(path: Path, sample_rate: int):
-        if shutil.which("ffmpeg") is None:
-            raise MissingDependencyError("ffmpeg command not found. Run `brew install ffmpeg`.")
+        try:
+            import av
+            
+            container = av.open(str(path))
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(format="fltp", layout="stereo", rate=sample_rate)
+            
+            chunks = []
+            for frame in container.decode(stream):
+                resampled = resampler.resample(frame)
+                if resampled:
+                    for r in resampled:
+                        chunks.append(r.to_ndarray())
+            container.close()
+            
+            if not chunks:
+                raise BackendError(f"No audio frames decoded from {path}")
+                
+            return np.concatenate(chunks, axis=1)
+        except Exception:
+            if shutil.which("ffmpeg") is None:
+                raise MissingDependencyError("ffmpeg command not found. Run `brew install ffmpeg`.")
 
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(path),
-                "-f",
-                "f32le",
-                "-acodec",
-                "pcm_f32le",
-                "-ac",
-                "2",
-                "-ar",
-                str(sample_rate),
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            message = result.stderr.decode("utf-8", "ignore").strip()
-            raise BackendError(message or f"could not decode {path}")
-        return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 2).T.copy()
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-f",
+                    "f32le",
+                    "-acodec",
+                    "pcm_f32le",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    str(sample_rate),
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                message = result.stderr.decode("utf-8", "ignore").strip()
+                raise BackendError(message or f"could not decode {path}")
+            return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 2).T.copy()
 
     @staticmethod
     def _validate_stem_sum(master, stems: dict[str, object]) -> str:

@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "stems" }]
 keywords = ["traktor", "stems", "source-separation", "dj"]
 dependencies = [
+  "av>=18.0.0",
   "demucs>=4.0.1",
   "demucs-mlx",
   "huggingface-hub>=1.22.0",

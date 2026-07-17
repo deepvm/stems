@@ -207,9 +207,9 @@ def _validate_process_args(args: argparse.Namespace) -> None:
         raise StemBatchError("only --track-workers 1 is supported")
     if args.batch_size < 0:
         raise StemBatchError("--batch-size must be 0 (for auto-detect) or greater")
-    if args.mlx_cache_limit_mb < 0:
+    if args.mlx_cache_limit_mb is not None and args.mlx_cache_limit_mb < 0:
         raise StemBatchError("--mlx-cache-limit-mb must be 0 or greater")
-    if args.mlx_memory_limit_mb < 0:
+    if args.mlx_memory_limit_mb is not None and args.mlx_memory_limit_mb < 0:
         raise StemBatchError("--mlx-memory-limit-mb must be 0 or greater")
     if args.cooling_pause is not None and args.cooling_pause < 0:
         raise StemBatchError("--cooling-pause must be 0 or greater")
@@ -255,7 +255,18 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 0
 
 
+def _assert_apple_silicon() -> None:
+    import platform
+    import sys
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        raise StemBatchError(
+            "This application is optimized specifically for Apple Silicon (M-series) Macs running macOS.\n"
+            "Intel Macs, Windows, and Linux are not supported by the MLX Metal backend."
+        )
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
+    _assert_apple_silicon()
     tracks = scan_music_dir(Path(args.music_dir))
     collection = _collection(args.collection)
     tracks = _enrich_tracks(tracks, collection)
@@ -268,6 +279,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_process(args: argparse.Namespace) -> int:
+    _assert_apple_silicon()
     _validate_process_args(args)
     music_dir = Path(args.music_dir).expanduser()
     stems_dir = Path(args.stems_dir).expanduser()
@@ -287,36 +299,51 @@ def cmd_process(args: argparse.Namespace) -> int:
         gpu_cores = detect_gpu_cores()
     except Exception:
         pass
+    total_ram_mb = detect_physical_ram_mb()
 
     # Apply profile defaults
     if args.profile == "silent":
         profile_batch_size = 4
         profile_workers = 1
         profile_cooling = 1.0
+        profile_memory_limit = max(4096, int(total_ram_mb * 0.30))
+        profile_cache_limit = 256
+    elif args.profile == "ultra":
+        profile_batch_size = max(1, gpu_cores)
+        profile_workers = max(1, (cpu_cores - 1) // 3)
+        profile_cooling = 0.0
+        profile_memory_limit = max(4096, int(total_ram_mb * 0.85))
+        profile_cache_limit = 1024
     elif args.profile == "extreme":
         profile_batch_size = max(1, gpu_cores // 2)
         profile_workers = max(1, (cpu_cores - 1) // 5)
         profile_cooling = 0.0
+        profile_memory_limit = max(4096, int(total_ram_mb * 0.70))
+        profile_cache_limit = 512
     else:  # balanced
         profile_batch_size = max(1, gpu_cores // 2)
         profile_workers = max(1, (cpu_cores - 2) // 5)
         profile_cooling = 0.5
+        profile_memory_limit = max(4096, int(total_ram_mb * 0.50))
+        profile_cache_limit = 512
 
     batch_size = args.batch_size if args.batch_size > 0 else profile_batch_size
     max_workers = profile_workers
     cooling_pause = args.cooling_pause if args.cooling_pause is not None else profile_cooling
+    memory_limit_mb = args.mlx_memory_limit_mb if args.mlx_memory_limit_mb is not None else profile_memory_limit
+    cache_limit_mb = args.mlx_cache_limit_mb if args.mlx_cache_limit_mb is not None else profile_cache_limit
 
     if args.verbose_backend or args.dry_run:
-        _status(f"Profile: {args.profile}. GPU cores: {gpu_cores}, CPU cores: {cpu_cores}.")
-        _status(f"Settings: batch-size={batch_size}, workers={max_workers}, cooling-pause={cooling_pause}s.")
+        _status(f"Profile: {args.profile}. GPU cores: {gpu_cores}, CPU cores: {cpu_cores}, RAM: {total_ram_mb}MB.")
+        _status(f"Settings: batch-size={batch_size}, workers={max_workers}, cooling-pause={cooling_pause}s, mlx-mem={memory_limit_mb}MB, mlx-cache={cache_limit_mb}MB.")
 
     backend = build_backend(
         name=args.backend,
         model=args.model,
         shifts=args.shifts,
         verbose=args.verbose_backend,
-        cache_limit_mb=args.mlx_cache_limit_mb,
-        memory_limit_mb=args.mlx_memory_limit_mb,
+        cache_limit_mb=cache_limit_mb,
+        memory_limit_mb=memory_limit_mb,
         batch_size=batch_size,
         overlap=args.overlap,
     )
@@ -499,7 +526,7 @@ def cmd_process(args: argparse.Namespace) -> int:
                         batch_size=backend.batch_size,
                         shifts=backend.shifts,
                         split=True,
-                        overlap=0.25,
+                        overlap=backend.overlap,
                         progress=backend.verbose,
                         segment=None,
                     )
@@ -515,10 +542,6 @@ def cmd_process(args: argparse.Namespace) -> int:
                 
                 separated_audio = SeparatedAudio(master=master, stems=stems, sample_rate=sample_rate)
                 
-                # Cleanup MLX GPU caches immediately
-                mx.clear_cache()
-                gc.collect()
-                
                 # Dispatch encoding task to CPU thread pool
                 future = executor.submit(
                     encode_and_finalize,
@@ -531,6 +554,26 @@ def cmd_process(args: argparse.Namespace) -> int:
                     dry_run=args.dry_run
                 )
                 futures.append((item, future))
+                
+                # Release array references immediately in the main thread
+                del out, separated, stems, separated_audio
+                
+                # Dynamic resource throttling based on active memory usage and system thermals
+                try:
+                    avail_ram = _get_available_ram_mb()
+                    if avail_ram < 2048:
+                        _status(f"Warning: Low available memory ({avail_ram}MB). Throttling resource usage...")
+                        import mlx.core as mx
+                        mx.clear_cache()
+                        import gc
+                        gc.collect()
+                        time.sleep(2.0)
+                        
+                    if _check_thermal_warning():
+                        _status("Warning: Thermal/performance warning level detected. Throttling execution for cooling...")
+                        time.sleep(2.0)
+                except Exception:
+                    pass
                 
                 # Optional cooling pause between tracks to prevent thermal throttling
                 if cooling_pause > 0 and not args.dry_run:
@@ -553,6 +596,15 @@ def cmd_process(args: argparse.Namespace) -> int:
             state.set(item.track.path, "error", output_path=item.output, error=str(exc))
         raise
     finally:
+        # Clear GPU allocator caches and run full GC on shutdown
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+
         if args.update_collection and collection_backup is not None:
             _status("Saving updated Traktor collection to disk...")
             try:
@@ -579,6 +631,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate_native(args: argparse.Namespace) -> int:
+    _assert_apple_silicon()
     collection = _collection(args.collection)
     if collection is None:
         raise StemBatchError("collection not found")
@@ -613,6 +666,15 @@ def cmd_calibrate_native(args: argparse.Namespace) -> int:
     return 0
 
 
+def detect_physical_ram_mb() -> int:
+    try:
+        import subprocess
+        output = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], encoding='utf-8')
+        return int(output.strip()) // (1024 * 1024)
+    except Exception:
+        return 8192
+
+
 def detect_gpu_cores() -> int | None:
     import subprocess
     import re
@@ -629,16 +691,45 @@ def detect_gpu_cores() -> int | None:
     return None
 
 
-def build_parser() -> argparse.ArgumentParser:
-    # Calculate a safe default memory limit: 70% of total physical RAM
-    total_ram_mb = 8192
+def _get_available_ram_mb() -> int:
+    import subprocess
+    import re
     try:
-        import subprocess
-        output = subprocess.check_output(['sysctl', '-n', 'hw.memsize'], encoding='utf-8')
-        total_ram_mb = int(output.strip()) // (1024 * 1024)
+        out = subprocess.check_output(["vm_stat"], encoding="utf-8")
+        page_size = 4096
+        try:
+            page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], encoding="utf-8").strip())
+        except Exception:
+            pass
+        free_pages = 0
+        speculative_pages = 0
+        for line in out.splitlines():
+            if "Pages free:" in line:
+                free_pages = int(re.search(r'Pages free:\s*(\d+)', line).group(1))
+            elif "Pages speculative:" in line:
+                speculative_pages = int(re.search(r'Pages speculative:\s*(\d+)', line).group(1))
+        return (free_pages + speculative_pages) * page_size // (1024 * 1024)
+    except Exception:
+        return 4096
+
+
+def _check_thermal_warning() -> bool:
+    import subprocess
+    try:
+        out = subprocess.check_output(['pmset', '-g', 'therm'], encoding='utf-8')
+        if "warning" in out.lower() and "no thermal warning" not in out.lower():
+            return True
+        if "performance warning" in out.lower() and "no performance warning" not in out.lower():
+            return True
     except Exception:
         pass
-    default_memory_limit = max(4096, int(total_ram_mb * 0.70))
+    return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Calculate a safe default memory limit: 70% of total physical RAM
+    total_ram_mb = detect_physical_ram_mb()
+    safe_mem_limit = max(4096, int(total_ram_mb * 0.70))
 
     parser = argparse.ArgumentParser(
         prog="traktor-stem-batch",
@@ -735,18 +826,18 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument(
         "--mlx-cache-limit-mb",
         type=int,
-        default=512,
-        help="MLX compilation cache limit in MB (default: %(default)s)"
+        default=None,
+        help="MLX compilation cache limit in MB (default: derived from profile)"
     )
     process.add_argument(
         "--mlx-memory-limit-mb",
         type=int,
-        default=default_memory_limit,
-        help="MLX memory limit in MB (default: %(default)s)"
+        default=None,
+        help="MLX memory limit in MB (default: derived from profile)"
     )
     process.add_argument(
         "--profile",
-        choices=["silent", "balanced", "extreme"],
+        choices=["silent", "balanced", "extreme", "ultra"],
         default="balanced",
         help="Resource profile adjusting batch sizes, CPU thread workers, and cooling pauses (choices: %(choices)s, default: %(default)s)"
     )
