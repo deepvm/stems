@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import CollectionError
+
+
+def normalize_path(path: Path) -> Path:
+    return Path(unicodedata.normalize("NFC", str(path)))
 
 
 def nml_dir_to_path(dir_value: str, file_value: str) -> Path:
@@ -59,9 +64,10 @@ class TraktorCollection:
             return self._by_path_cache
         cache = {}
         for entry in self.entries():
-            cache[entry.path] = entry
+            norm_path = normalize_path(entry.path)
+            cache[norm_path] = entry
             try:
-                resolved = entry.path.expanduser().resolve()
+                resolved = normalize_path(entry.path.expanduser().resolve())
                 cache[resolved] = entry
             except OSError:
                 pass
@@ -69,12 +75,12 @@ class TraktorCollection:
         return self._by_path_cache
 
     def find(self, audio_path: Path) -> CollectionEntry | None:
-        target = audio_path.expanduser()
+        target = normalize_path(audio_path.expanduser())
         entry = self.by_path().get(target)
         if entry is not None:
             return entry
         try:
-            resolved = target.resolve()
+            resolved = normalize_path(target.resolve())
             entry = self.by_path().get(resolved)
             if entry is not None:
                 return entry
@@ -95,9 +101,10 @@ class TraktorCollection:
             if not dir_value or not file_value:
                 continue
             entry_path = nml_dir_to_path(dir_value, file_value)
-            cache[entry_path] = entry
+            norm_path = normalize_path(entry_path)
+            cache[norm_path] = entry
             try:
-                resolved = entry_path.expanduser().resolve()
+                resolved = normalize_path(entry_path.expanduser().resolve())
                 cache[resolved] = entry
             except OSError:
                 pass
@@ -105,12 +112,12 @@ class TraktorCollection:
         return self._element_by_path_cache
 
     def entry_element(self, audio_path: Path) -> ET.Element | None:
-        target = audio_path.expanduser()
+        target = normalize_path(audio_path.expanduser())
         el = self._element_by_path().get(target)
         if el is not None:
             return el
         try:
-            resolved = target.resolve()
+            resolved = normalize_path(target.resolve())
             el = self._element_by_path().get(resolved)
             if el is not None:
                 return el
