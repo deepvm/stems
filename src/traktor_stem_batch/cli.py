@@ -452,7 +452,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         decode_thread = threading.Thread(target=decode_worker, daemon=True)
         decode_thread.start()
 
-        def encode_and_finalize(item, separated_audio, codec, bitrate, output_sample_rate, native, dry_run):
+        def encode_and_finalize(item, separated_audio, codec, bitrate, output_sample_rate, native, dry_run, track_started):
             started = time.monotonic()
             work_dir = work_dir_root / sanitize_filename(item.track.path.stem)
             
@@ -494,7 +494,7 @@ def cmd_process(args: argparse.Namespace) -> int:
                 if not ok:
                     raise StemBatchError(msg)
                     
-            return ProcessResult(item=item, elapsed=time.monotonic() - started, work_dir=work_dir)
+            return ProcessResult(item=item, elapsed=time.monotonic() - track_started, work_dir=work_dir)
 
         # Thread pool for encoding/MP4Box packaging, dynamically sized to prevent CPU starvation
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -514,6 +514,7 @@ def cmd_process(args: argparse.Namespace) -> int:
                 item_q, master, sample_rate = decode_res
                 assert item_q == item
                 
+                track_started = time.monotonic()
                 _status(f"[{item.index}/{item.total}] separate: {item.track.display_name}")
                 
                 # Main GPU separation stage (runs on the main thread for GIL and KeyboardInterrupt stability)
@@ -536,6 +537,9 @@ def cmd_process(args: argparse.Namespace) -> int:
                     gc.collect()
                     raise exc
                 
+                gpu_elapsed = time.monotonic() - started_gpu
+                _status(f"[{item.index}/{item.total}] separated on GPU in {gpu_elapsed:.2f}s: {item.track.display_name}")
+                
                 separated = np.array(out[0]).astype("float32", copy=False)
                 stems = {name: separated[index] for index, name in enumerate(STEM_NAMES)}
                 backend._validate_stem_sum(master, stems)
@@ -551,7 +555,8 @@ def cmd_process(args: argparse.Namespace) -> int:
                     bitrate=args.bitrate,
                     output_sample_rate=args.sample_rate,
                     native=(args.mode == "native"),
-                    dry_run=args.dry_run
+                    dry_run=args.dry_run,
+                    track_started=track_started
                 )
                 futures.append((item, future))
                 
@@ -560,18 +565,21 @@ def cmd_process(args: argparse.Namespace) -> int:
                 
                 # Dynamic resource throttling based on active memory usage and system thermals
                 try:
-                    avail_ram = _get_available_ram_mb()
-                    if avail_ram < 2048:
-                        _status(f"Warning: Low available memory ({avail_ram}MB). Throttling resource usage...")
-                        import mlx.core as mx
-                        mx.clear_cache()
-                        import gc
-                        gc.collect()
-                        time.sleep(2.0)
-                        
-                    if _check_thermal_warning():
-                        _status("Warning: Thermal/performance warning level detected. Throttling execution for cooling...")
-                        time.sleep(2.0)
+                    now = time.monotonic()
+                    if not hasattr(finish_result, "_last_health_check") or now - finish_result._last_health_check > 30.0:
+                        finish_result._last_health_check = now
+                        avail_ram = _get_available_ram_mb()
+                        if avail_ram < 2048:
+                            _status(f"Warning: Low available memory ({avail_ram}MB). Throttling resource usage...")
+                            import mlx.core as mx
+                            mx.clear_cache()
+                            import gc
+                            gc.collect()
+                            time.sleep(2.0)
+                            
+                        if _check_thermal_warning():
+                            _status("Warning: Thermal/performance warning level detected. Throttling execution for cooling...")
+                            time.sleep(2.0)
                 except Exception:
                     pass
                 

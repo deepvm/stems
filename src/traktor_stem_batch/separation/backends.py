@@ -317,11 +317,24 @@ def apply_model_batched(
     chunk_outs_list = []
     for i in range(0, len(chunks), batch_size):
         batch_chunks = chunks_stacked[i:i + batch_size]
+        actual_batch_len = batch_chunks.shape[0]
+        
+        # Pad last batch to avoid MLX model recompilation for different shapes
+        if actual_batch_len < batch_size:
+            pad_size = batch_size - actual_batch_len
+            padding = mx.zeros((pad_size, *batch_chunks.shape[1:]), dtype=batch_chunks.dtype)
+            batch_chunks = mx.concatenate([batch_chunks, padding], axis=0)
+            
         if hasattr(model, "forward_compiled"):
             batch_out = model.forward_compiled(batch_chunks)
         else:
             batch_out = model(batch_chunks)
         mx.eval(batch_out)
+        
+        # Discard the padded portion
+        if actual_batch_len < batch_size:
+            batch_out = batch_out[:actual_batch_len]
+            
         chunk_outs_list.append(batch_out)
 
     # 4. Concatenate batch outputs

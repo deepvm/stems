@@ -214,6 +214,8 @@ def write_native_stem_arrays(
             "-hide_banner",
             "-loglevel",
             "error",
+            "-threads",
+            "0",
             "-f",
             "f32le",
             "-ar",
