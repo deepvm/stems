@@ -497,10 +497,12 @@ class MlxDemucsBackend:
                     continue
                 
                 # Remap key names to match MLX module structures
-                if ".conv.weight" in new_key:
-                    new_key = new_key.replace(".conv.weight", ".weight")
-                if ".conv.bias" in new_key:
-                    new_key = new_key.replace(".conv.bias", ".bias")
+                if new_key.startswith("channel_") and ".conv." in new_key:
+                    new_key = new_key.replace(".conv.", ".")
+                if ".conv_tr.conv." in new_key:
+                    new_key = new_key.replace(".conv_tr.conv.", ".conv_tr.")
+                if ".dconv." in new_key and ".conv." in new_key:
+                    new_key = new_key.replace(".conv.", ".")
                 if ".attn." in new_key:
                     new_key = new_key.replace(".attn.", ".self_attn.")
                 if ".norm_out.gn." in new_key:
