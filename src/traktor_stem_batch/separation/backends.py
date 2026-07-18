@@ -503,6 +503,10 @@ class MlxDemucsBackend:
                     new_key = new_key.replace(".conv_tr.conv.", ".conv_tr.")
                 if ".dconv." in new_key and ".conv." in new_key:
                     new_key = new_key.replace(".conv.", ".")
+                if ".conv.conv." in new_key:
+                    new_key = new_key.replace(".conv.conv.", ".conv.")
+                if ".rewrite.conv." in new_key:
+                    new_key = new_key.replace(".rewrite.conv.", ".rewrite.")
                 if ".attn." in new_key:
                     new_key = new_key.replace(".attn.", ".self_attn.")
                 if ".norm_out.gn." in new_key:
