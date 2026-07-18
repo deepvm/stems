@@ -467,8 +467,56 @@ class MlxDemucsBackend:
             model = HybridHTDemucs(**valid_kwargs)
             flat_state = mx.load(str(safetensors_path))
             
-            # Ensure all values are mx.array
-            flat_state_mx = {k: mx.array(v) if isinstance(v, np.ndarray) else v for k, v in flat_state.items()}
+            # If the weights are wrapped in a Bag of Models (keys start with model_X.)
+            # we extract model_0's weights and strip the prefix to match a single HTDemucs instance.
+            import re
+            is_bagged = any(k.startswith("model_0.") for k in flat_state.keys())
+            flat_state_mx = {}
+            for k, v in flat_state.items():
+                new_key = k
+                if new_key.startswith("model_0."):
+                    new_key = new_key[len("model_0."):]
+                elif is_bagged:
+                    # Skip weights belonging to model_1, model_2, model_3
+                    continue
+                
+                # Split in_proj_weight and in_proj_bias for attention layers
+                if "in_proj_weight" in new_key:
+                    dim = v.shape[0] // 3
+                    prefix = new_key.rsplit("in_proj_weight", 1)[0]
+                    flat_state_mx[prefix + "q_proj.weight"] = mx.array(v[:dim])
+                    flat_state_mx[prefix + "k_proj.weight"] = mx.array(v[dim:2*dim])
+                    flat_state_mx[prefix + "v_proj.weight"] = mx.array(v[2*dim:])
+                    continue
+                elif "in_proj_bias" in new_key:
+                    dim = v.shape[0] // 3
+                    prefix = new_key.rsplit("in_proj_bias", 1)[0]
+                    flat_state_mx[prefix + "q_proj.bias"] = mx.array(v[:dim])
+                    flat_state_mx[prefix + "k_proj.bias"] = mx.array(v[dim:2*dim])
+                    flat_state_mx[prefix + "v_proj.bias"] = mx.array(v[2*dim:])
+                    continue
+                
+                # Remap key names to match MLX module structures
+                if ".conv.weight" in new_key:
+                    new_key = new_key.replace(".conv.weight", ".weight")
+                if ".conv.bias" in new_key:
+                    new_key = new_key.replace(".conv.bias", ".bias")
+                if ".attn." in new_key:
+                    new_key = new_key.replace(".attn.", ".self_attn.")
+                if ".norm_out.gn." in new_key:
+                    new_key = new_key.replace(".norm_out.gn.", ".norm_out.")
+                if ".key_proj." in new_key:
+                    new_key = new_key.replace(".key_proj.", ".k_proj.")
+                if ".query_proj." in new_key:
+                    new_key = new_key.replace(".query_proj.", ".q_proj.")
+                if ".value_proj." in new_key:
+                    new_key = new_key.replace(".value_proj.", ".v_proj.")
+                
+                # Fix DConv sequential layer path mapping (e.g. layers.0.layers.0 -> layers.0.0)
+                new_key = re.sub(r'\.dconv\.layers\.(\d+)\.layers\.(\d+)\.', r'.dconv.layers.\1.\2.', new_key)
+                
+                flat_state_mx[new_key] = mx.array(v) if isinstance(v, np.ndarray) else v
+                
             _load_weights(model, flat_state_mx)
             
             # Cast model parameters to float16
