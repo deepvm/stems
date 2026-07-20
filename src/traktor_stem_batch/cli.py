@@ -309,7 +309,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         profile_memory_limit = max(4096, int(total_ram_mb * 0.30))
         profile_cache_limit = 256
     elif args.profile == "ultra":
-        profile_batch_size = max(1, gpu_cores)
+        profile_batch_size = 8
         profile_workers = max(1, (cpu_cores - 1) // 3)
         profile_cooling = 0.0
         profile_memory_limit = max(4096, int(total_ram_mb * 0.85))
