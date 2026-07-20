@@ -556,6 +556,7 @@ class MlxDemucsBackend:
             
             container = av.open(str(path))
             stream = container.streams.audio[0]
+            stream.thread_type = "AUTO"
             resampler = av.AudioResampler(format="fltp", layout="stereo", rate=sample_rate)
             
             chunks = []

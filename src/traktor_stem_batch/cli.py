@@ -310,7 +310,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         profile_cache_limit = 256
     elif args.profile == "ultra":
         profile_batch_size = 8
-        profile_workers = max(1, (cpu_cores - 1) // 3)
+        profile_workers = max(2, (cpu_cores - 1) // 2)
         profile_cooling = 0.0
         profile_memory_limit = max(4096, int(total_ram_mb * 0.85))
         profile_cache_limit = 1024
@@ -361,12 +361,9 @@ def cmd_process(args: argparse.Namespace) -> int:
             )
             item = ProcessItem(index=index, total=len(tracks), track=track, output=output)
             if not args.dry_run and not args.reprocess_existing and not args.force:
-                if state is not None and state.is_done_current(track.path) and output.exists():
-                    ready, reason = True, "state db shows done"
-                else:
-                    ready, reason = _native_stem_ready(output)
-                if ready:
-                    if args.update_collection:
+                stem_ok, reason = _native_stem_ready(output)
+                if stem_ok:
+                    if args.update_collection and collection is not None:
                         collection_backup, changed = _mark_collection_stem(
                             collection=collection,
                             track=track,
@@ -378,6 +375,10 @@ def cmd_process(args: argparse.Namespace) -> int:
                         state.set(track.path, "done", output_path=output)
                     _status(f"[{index}/{len(tracks)}] skip existing: {track.display_name}")
                     continue
+                else:
+                    if state is not None and state.is_done_current(track.path):
+                        _status(f"[{index}/{len(tracks)}] re-evaluating: {track.display_name} ({reason})")
+                        state.set(track.path, "pending", output_path=output)
             if state is not None:
                 state.set(track.path, "running", output_path=output)
             pending.append(item)
@@ -432,7 +433,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         import mlx.core as mx
         import numpy as np
 
-        decode_queue = queue.Queue(maxsize=1)
+        decode_queue = queue.Queue(maxsize=max(4, max_workers * 2))
         decode_error = None
 
         def decode_worker():
