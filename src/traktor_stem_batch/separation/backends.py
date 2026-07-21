@@ -660,6 +660,7 @@ def build_backend(
     memory_limit_mb: int = 8192,
     batch_size: int = 1,
     overlap: float = 0.1,
+    segment: float | None = None,
 ) -> MlxDemucsBackend:
     if name not in SUPPORTED_BACKENDS:
         raise BackendError("only --backend demucs-mlx is supported")
@@ -671,4 +672,5 @@ def build_backend(
         memory_limit_mb=memory_limit_mb,
         batch_size=batch_size,
         overlap=overlap,
+        segment=segment,
     )

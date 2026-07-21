@@ -346,6 +346,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         memory_limit_mb=memory_limit_mb,
         batch_size=batch_size,
         overlap=args.overlap,
+        segment=None,
     )
     tracks = _process_tracks(args, collection)
 
@@ -864,6 +865,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Overlap between chunks for separation (default: %(default)s)"
     )
+
     process.add_argument(
         "--work-dir",
         default=str(DEFAULT_STATE_DIR / "work"),
