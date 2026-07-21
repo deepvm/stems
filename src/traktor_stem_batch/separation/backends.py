@@ -213,21 +213,7 @@ class HybridHTDemucs(HTDemucs):
         return result
 
 
-def _add_weighted(out: mx.array, chunk: mx.array, weight: mx.array,
-                  offset: int, length: int) -> mx.array:
-    weighted = weight[None, None, None, :] * chunk
-    before = out[..., :offset]
-    middle = out[..., offset:offset + length] + weighted
-    after = out[..., offset + length:]
-    return mx.concatenate([before, middle, after], axis=-1)
 
-
-def _add_weight(sum_w: mx.array, weight: mx.array,
-                offset: int, length: int) -> mx.array:
-    before = sum_w[:offset]
-    middle = sum_w[offset:offset + length] + weight
-    after = sum_w[offset + length:]
-    return mx.concatenate([before, middle, after], axis=0)
 
 
 def apply_model_batched(
@@ -340,22 +326,22 @@ def apply_model_batched(
     # 4. Concatenate batch outputs
     chunk_outs = mx.concatenate(chunk_outs_list, axis=0)
 
-    # 5. Accumulate
-    out = mx.zeros((batch, len(model.sources), channels, length))
-    sum_weight = mx.zeros((length,))
+    # Convert to NumPy for ultra-fast, zero-overhead sliding-window reconstruction
+    import numpy as np
+    chunk_outs_np = np.array(chunk_outs)
+    weight_np = np.array(weight)
+    
+    out_np = np.zeros((batch, len(model.sources), channels, length), dtype=np.float32)
+    sum_weight_np = np.zeros((length,), dtype=np.float32)
 
     for idx, (offset, actual_len) in enumerate(chunk_info):
-        chunk_out = chunk_outs[idx] # shape: [S, C, T_segment]
-        chunk_out = chunk_out[None] # shape: [1, S, C, T_segment]
-        
-        chunk_out = chunk_out[..., :actual_len]
-        w = weight[:actual_len]
+        chunk_out = chunk_outs_np[idx, ..., :actual_len]
+        w = weight_np[:actual_len]
+        out_np[..., offset:offset + actual_len] += w[None, None, :] * chunk_out
+        sum_weight_np[offset:offset + actual_len] += w
 
-        out = _add_weighted(out, chunk_out, w, offset, actual_len)
-        sum_weight = _add_weight(sum_weight, w, offset, actual_len)
-
-    out = out / mx.maximum(sum_weight[None, None, None, :], mx.array(1e-8))
-    return out
+    out_np /= np.maximum(sum_weight_np[None, None, None, :], 1e-8)
+    return mx.array(out_np)
 
 
 class MlxDemucsBackend:
