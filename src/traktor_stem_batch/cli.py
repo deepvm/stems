@@ -445,7 +445,9 @@ def cmd_process(args: argparse.Namespace) -> int:
                     if args.verbose_backend:
                         _status(f"[{item.index}/{item.total}] pre-decode: {item.track.display_name}")
                     master = backend._load_audio(item.track.path, sample_rate)
-                    decode_queue.put((item, master, sample_rate))
+                    master_mx = mx.array(master[None], dtype=mx.float32)
+                    mx.eval(master_mx)
+                    decode_queue.put((item, master, master_mx, sample_rate))
             except Exception as e:
                 decode_error = e
                 decode_queue.put(None)
@@ -512,7 +514,7 @@ def cmd_process(args: argparse.Namespace) -> int:
                         raise decode_error
                     raise StemBatchError("Pre-decode worker stopped unexpectedly")
                 
-                item_q, master, sample_rate = decode_res
+                item_q, master, master_mx, sample_rate = decode_res
                 assert item_q == item
                 
                 track_started = time.monotonic()
@@ -524,13 +526,13 @@ def cmd_process(args: argparse.Namespace) -> int:
                 try:
                     out = apply_model_batched(
                         model,
-                        mx.array(master[None]),
+                        master_mx,
                         batch_size=backend.batch_size,
                         shifts=backend.shifts,
                         split=True,
                         overlap=backend.overlap,
                         progress=backend.verbose,
-                        segment=None,
+                        segment=getattr(backend, "segment", None),
                     )
                     mx.eval(out)
                 except Exception as exc:

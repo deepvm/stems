@@ -370,6 +370,7 @@ class MlxDemucsBackend:
         memory_limit_mb: int = 8192,
         batch_size: int = 1,
         overlap: float = 0.1,
+        segment: float | None = None,
     ):
         if model not in SUPPORTED_MLX_MODELS:
             raise BackendError(f"only --model {', '.join(SUPPORTED_MLX_MODELS)} are supported")
@@ -384,6 +385,7 @@ class MlxDemucsBackend:
         self.memory_limit_mb = memory_limit_mb
         self.batch_size = batch_size
         self.overlap = overlap
+        self.segment = segment
         self._model = None
 
     def _load_model(self) -> HybridHTDemucs:
@@ -621,24 +623,27 @@ class MlxDemucsBackend:
             raise BackendError(f"stem sum sanity failed: corr={corr:.3f}, rms_ratio={ratio:.3f}")
         return f"corr={corr:.3f}, rms_ratio={ratio:.3f}"
 
-    def separate(self, input_path: Path, dry_run: bool = False) -> SeparatedAudio | None:
+    def separate_audio(self, master, master_mx=None, dry_run: bool = False) -> SeparatedAudio | None:
         if dry_run:
-            print(f"demucs-mlx {self.model_name} --shifts {self.shifts} {input_path}")
             return None
 
         model = self._load_model()
         sample_rate = int(model.samplerate)
-        master = self._load_audio(input_path, sample_rate)
+        if master_mx is None:
+            master_mx = mx.array(master[None], dtype=mx.float32)
+        elif master_mx.ndim == 2:
+            master_mx = master_mx[None]
+
         try:
             out = apply_model_batched(
                 model,
-                mx.array(master[None]),
+                master_mx,
                 batch_size=self.batch_size,
                 shifts=self.shifts,
                 split=True,
                 overlap=self.overlap,
                 progress=self.verbose,
-                segment=None,
+                segment=self.segment,
             )
             mx.eval(out)
             separated = np.array(out[0]).astype("float32", copy=False)
@@ -648,6 +653,16 @@ class MlxDemucsBackend:
         finally:
             mx.clear_cache()
             gc.collect()
+
+    def separate(self, input_path: Path, dry_run: bool = False) -> SeparatedAudio | None:
+        if dry_run:
+            print(f"demucs-mlx {self.model_name} --shifts {self.shifts} {input_path}")
+            return None
+
+        model = self._load_model()
+        sample_rate = int(model.samplerate)
+        master = self._load_audio(input_path, sample_rate)
+        return self.separate_audio(master=master, dry_run=dry_run)
 
 
 def build_backend(
