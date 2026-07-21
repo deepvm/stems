@@ -847,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument(
         "--profile",
         choices=["silent", "balanced", "extreme", "ultra"],
-        default="balanced",
+        default="ultra",
         help="Resource profile adjusting batch sizes, CPU thread workers, and cooling pauses (choices: %(choices)s, default: %(default)s)"
     )
     process.add_argument(
