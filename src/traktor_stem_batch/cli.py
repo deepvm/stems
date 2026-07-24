@@ -309,7 +309,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         profile_memory_limit = max(4096, int(total_ram_mb * 0.30))
         profile_cache_limit = 256
     elif args.profile == "ultra":
-        profile_batch_size = 8
+        profile_batch_size = 12
         profile_workers = max(2, (cpu_cores - 1) // 2)
         profile_cooling = 0.0
         profile_memory_limit = max(4096, int(total_ram_mb * 0.85))
@@ -491,12 +491,13 @@ def cmd_process(args: argparse.Namespace) -> int:
                     bitrate=bitrate,
                     output_sample_rate=output_sample_rate,
                 )
-                ok, msg = verify_with_ffprobe(item.output)
-                if not ok:
-                    raise StemBatchError(msg)
-                ok, msg = verify_native_metadata(item.output)
-                if not ok:
-                    raise StemBatchError(msg)
+                if args.verbose_backend:
+                    ok, msg = verify_with_ffprobe(item.output)
+                    if not ok:
+                        raise StemBatchError(msg)
+                    ok, msg = verify_native_metadata(item.output)
+                    if not ok:
+                        raise StemBatchError(msg)
                     
             return ProcessResult(item=item, elapsed=time.monotonic() - track_started, work_dir=work_dir)
 

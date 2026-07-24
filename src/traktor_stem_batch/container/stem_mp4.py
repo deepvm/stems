@@ -247,10 +247,11 @@ def write_native_stem_arrays(
         try:
             if process.stdin is None:
                 raise StemBatchError("ffmpeg stdin is not available")
-            raw_bytes = stacked.tobytes()
-            chunk_size = 128 * 1024  # 128 KB buffer chunks
-            for offset in range(0, len(raw_bytes), chunk_size):
-                process.stdin.write(raw_bytes[offset : offset + chunk_size])
+            flat = stacked.view(np.uint8).reshape(-1)
+            mv = memoryview(flat)
+            chunk_size = 4 * 1024 * 1024  # 4 MB chunks (32x fewer loop iterations, zero-copy)
+            for offset in range(0, mv.nbytes, chunk_size):
+                process.stdin.write(mv[offset : offset + chunk_size])
             process.stdin.close()
         except Exception as exc:
             process.terminate()
