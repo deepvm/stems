@@ -429,7 +429,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         import mlx.core as mx
         import numpy as np
 
-        decode_queue = queue.Queue(maxsize=max(4, max_workers * 2))
+        decode_queue = queue.Queue(maxsize=3)
         decode_error = None
 
         def decode_worker():
