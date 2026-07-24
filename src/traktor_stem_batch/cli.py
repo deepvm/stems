@@ -395,14 +395,9 @@ def cmd_process(args: argparse.Namespace) -> int:
             warmup_start = time.monotonic()
             segment_len = int(model.samplerate * float(model.segment))
             
-            # Warm up for batch_size = 1
-            dummy_input_1 = mx.zeros((1, 2, segment_len), dtype=mx.float32)
-            mx.eval(model.forward_compiled(dummy_input_1))
-            
-            # Warm up for batch_size = batch_size
-            if batch_size > 1:
-                dummy_input_b = mx.zeros((batch_size, 2, segment_len), dtype=mx.float32)
-                mx.eval(model.forward_compiled(dummy_input_b))
+            # Warm up only for the exact batch_size shape since the last batch is padded
+            dummy_input = mx.zeros((batch_size, 2, segment_len), dtype=mx.float32)
+            mx.eval(model.forward_compiled(dummy_input))
                 
             _status(f"Model compiled successfully in {time.monotonic() - warmup_start:.1f}s.")
 
